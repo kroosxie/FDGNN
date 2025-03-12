@@ -123,11 +123,11 @@ def plot_topology(result):
 
 def calculate_path_loss(distance, pl_exponent):
     """ 计算路径损耗 """
-    return distance ** (-pl_exponent)
-    # return (distance * 400) ** (-pl_exponent)  # xjc: 假设单位：实际为1：400
+    # return distance ** (-pl_exponent)
+    return (distance + 2) ** (-pl_exponent)  # xjc: +2 是为了防止过近造成太大
 
 
-def generate_topology(N, K, pl_exponent=3.0, interference_radius=0.35, region_size=1.0):
+def generate_topology(N, K, pl_exponent=3.0, region_size=1.0):
     """
     生成带路径损耗的通信系统拓扑
     参数：
@@ -145,6 +145,11 @@ def generate_topology(N, K, pl_exponent=3.0, interference_radius=0.35, region_si
 
     dx = region_size / (cols * 2)
     dy = region_size / (rows * 2)
+
+    # 设：pathloss为小区边界的100倍的区域为基站覆盖范围边界
+    # 根据 R_inf = R_cell * 10^ (2/n) 计算，也可以适度调整
+    # interference_radius = dx * 10 ** (2 / pl_exponent)
+    interference_radius = dx/1.5 * 10 ** (2 / pl_exponent)  # 设pathloss为小区边界2/3处的100倍的区域为基站覆盖范围边界
 
     # 生成基站坐标
     positions_bs = np.array([
@@ -220,10 +225,9 @@ def generate_topology(N, K, pl_exponent=3.0, interference_radius=0.35, region_si
 if __name__ == "__main__":
     # 生成拓扑
     topology = generate_topology(
-        N=4,
+        N=16,
         K=6,
-        pl_exponent=4,  # 常取3~4
-        interference_radius=40,
+        pl_exponent=5,  # 常取3~4
         region_size=120
     )
 
