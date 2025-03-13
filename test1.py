@@ -189,12 +189,51 @@ def global_convert_to_pyg(result):
     return data
 
 
+def cell_convert_to_pyg(topology):
+    """ 将拓扑数据转换为基站级别的子图列表 """
+    G = topology['graph']
+    subgraphs = []
+
+    # 获取所有基站节点
+    bs_nodes = [n for n, attr in G.nodes(data=True) if attr['type'] == 'BS']
+
+    for bs in bs_nodes:
+        # 创建异构图数据
+        hetero_data = HeteroData()
+
+        # 获取当前基站的服务用户和干扰用户
+        service_ues = [v for _, v, d in G.out_edges(bs, data=True) if d['edge_type'] == 'service']
+        interf_ues = [v for _, v, d in G.out_edges(bs, data=True) if d['edge_type'] == 'interf']
+
+        # 收集节点特征
+        served_feats = [G[bs][ue]['channel'] for ue in service_ues]
+        interf_feats = [G[bs][ue]['channel'] for ue in interf_ues]
+
+        # 添加节点
+        hetero_data['served'].x = torch.tensor(served_feats, dtype=torch.float)
+        hetero_data['interfered'].x = torch.tensor(interf_feats, dtype=torch.float)
+
+        # 创建全连接边（不同类节点间）
+        if len(service_ues) > 0 and len(interf_ues) > 0:
+            src = torch.arange(len(service_ues)).repeat_interleave(len(interf_ues))
+            dst = torch.arange(len(interf_ues)).repeat(len(service_ues))
+
+            hetero_data['served', 'conn', 'interfered'].edge_index = torch.stack([src, dst], dim=0)
+        else:
+            print(f"基站 {bs} 缺少有效连接关系，跳过该子图")
+            continue  # 跳过该子图
+
+        subgraphs.append(hetero_data)
+
+    return subgraphs
+
+
 def analyze_topology(result):
     """ 拓扑分析报告 """
     print(f"天线数量（Nt）: {result['Nt']}")
-    print(f"注：一个链路定义为Nt个负信道的集合，包含2*Nt个值，前Nt个为实部值，后Nt个为虚部值")
     print(f"服务链路数量: {len(result['service_channels'])}")
     print(f"干扰链路数量: {len(result['interference_channels'])}")
+    print(f"注：一个链路定义为Nt个负信道的集合，包含2*Nt个值，前Nt个为实部值，后Nt个为虚部值")
 
     # 信道功率统计
     service_power = [np.mean(np.abs(c) ** 2) for c in result['service_channels']]
@@ -319,6 +358,13 @@ if __name__ == "__main__":
 
     # 转换为PyG数据
     pyg_data = global_convert_to_pyg(topology)
+
+    # 转换为子图列表
+    cell_graphs = cell_convert_to_pyg(topology)
+    print(f"\n生成基站子图数量: {len(cell_graphs)}")
+    for i, g in enumerate(cell_graphs):
+        print(f"子图{i}: 服务用户数={g['served'].x.shape[0] if 'served' in g.node_types else 0}, "
+              f"干扰用户数={g['interfered'].x.shape[0] if 'interfered' in g.node_types else 0}")
 
     # 可视化PyG数据 (将PyG数据转换回networkx，再次检查拓扑关系)
     plot_pyg_topology(pyg_data)
