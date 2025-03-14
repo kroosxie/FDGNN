@@ -171,28 +171,49 @@ def global_convert_to_pyg(result):
             interf_edges.append((src_idx, dst_idx))
             interf_attrs.append(attr['channel'])
 
+    # 全局信道统计量计算 --------------------------------------------------------
+    all_service = np.array(service_attrs, dtype=np.float32) if service_attrs else np.empty((0, 2 * Nt))
+    all_interf = np.array(interf_attrs, dtype=np.float32) if interf_attrs else np.empty((0, 2 * Nt))
+    all_channels = np.concatenate([all_service, all_interf], axis=0)
+
+    # 计算均值和标准差
+    mean = np.mean(all_channels, axis=0, keepdims=True)
+    std = np.std(all_channels, axis=0, keepdims=True) + 1e-8
+
     # 添加边到异构图
     if len(service_edges) > 0:
-        service_edges = torch.tensor(service_edges).t().contiguous()  # 形状 [2, Num_service_edges]
-        data['BS', 'service', 'UE'].edge_index = service_edges
-        data['BS', 'service', 'UE'].edge_attr = torch.tensor(
-            np.array(service_attrs), dtype=torch.float
-        )
+        service_edge_index = torch.tensor(service_edges).t().contiguous()  # 形状 [2, Num_service_edges]
+        # 标准化数据作为特征并保留原始数据
+        service_normalized = (all_service - mean) / std
+        data['BS', 'service', 'UE'].edge_index = service_edge_index
+        data['BS', 'service', 'UE'].edge_attr = torch.tensor(service_normalized, dtype=torch.float)
+        data['BS', 'service', 'UE'].original_channel = torch.tensor(all_service, dtype=torch.float)
 
     if len(interf_edges) > 0:
-        interf_edges = torch.tensor(interf_edges).t().contiguous()  # 形状 [2, Num_interf_edges]
-        data['BS', 'interf', 'UE'].edge_index = interf_edges
-        data['BS', 'interf', 'UE'].edge_attr = torch.tensor(
-            np.array(interf_attrs), dtype=torch.float
-        )
+        interf_edge_index = torch.tensor(interf_edges).t().contiguous()
+        # 标准化数据作为特征并保留原始数据
+        interf_normalized = (all_interf - mean) / std
+        data['BS', 'interf', 'UE'].edge_index = interf_edge_index
+        data['BS', 'interf', 'UE'].edge_attr = torch.tensor(interf_normalized, dtype=torch.float)
+        data['BS', 'interf', 'UE'].original_channel = torch.tensor(all_interf, dtype=torch.float)
 
     return data
 
 
 def cell_convert_to_pyg(topology):
-    """ 将拓扑数据转换为基站级别的子图列表 """
+    """ 将拓扑数据转换为基站级别的子图列表 （含特征规范化）"""
     G = topology['graph']
     subgraphs = []
+
+    # 全局信道统计量计算（用于数据规范化） --------------------------------------------------------
+    # 合并所有服务信道和干扰信道数据
+    all_service = topology['service_channels']  # shape [num_service, 2*Nt]
+    all_interf = topology['interference_channels']  # shape [num_interf, 2*Nt]
+    all_channels = np.concatenate([all_service, all_interf], axis=0)
+
+    # 计算全局均值和标准差（每个特征维度单独计算）
+    mean = np.mean(all_channels, axis=0, keepdims=True)  # shape [1, 2*Nt]
+    std = np.std(all_channels, axis=0, keepdims=True) + 1e-8  # 防止除零
 
     # 获取所有基站节点
     bs_nodes = [n for n, attr in G.nodes(data=True) if attr['type'] == 'BS']
@@ -205,19 +226,34 @@ def cell_convert_to_pyg(topology):
         service_ues = [v for _, v, d in G.out_edges(bs, data=True) if d['edge_type'] == 'service']
         interf_ues = [v for _, v, d in G.out_edges(bs, data=True) if d['edge_type'] == 'interf']
 
-        # 收集节点特征
+        # 收集节点特征（真实信达数据）
         served_feats = [G[bs][ue]['channel'] for ue in service_ues]
         interf_feats = [G[bs][ue]['channel'] for ue in interf_ues]
 
-        # 添加节点
-        hetero_data['served'].x = torch.tensor(served_feats, dtype=torch.float)
-        hetero_data['interfered'].x = torch.tensor(interf_feats, dtype=torch.float)
+        # 规范化处理 ----------------------------------------------------------
+        # 服务用户节点特征处理
+        if len(served_feats) > 0:
+            served_normalized = (served_feats - mean) / std
+            hetero_data['served'].x = torch.tensor(served_normalized)
+            hetero_data['served'].original_channel = torch.tensor(served_feats)
+        else:
+            # 处理空节点情况，保持特征维度一致
+            hetero_data['served'].x = torch.empty((0, all_channels.shape[1]))
+            hetero_data['served'].original_channel = torch.empty((0, all_channels.shape[1]))
 
-        # 创建全连接边（不同类节点间）
+        # 干扰用户节点特征处理
+        if len(interf_feats) > 0:
+            interf_normalized = (interf_feats - mean) / std
+            hetero_data['interfered'].x = torch.tensor(interf_normalized)
+            hetero_data['interfered'].original_channel = torch.tensor(interf_feats)
+        else:
+            hetero_data['interfered'].x = torch.empty((0, all_channels.shape[1]))
+            hetero_data['interfered'].original_channel = torch.empty((0, all_channels.shape[1]))
+
+        # 构建全连接边 （不同类节点间）
         if len(service_ues) > 0 and len(interf_ues) > 0:
             src = torch.arange(len(service_ues)).repeat_interleave(len(interf_ues))
             dst = torch.arange(len(interf_ues)).repeat(len(service_ues))
-
             hetero_data['served', 'conn', 'interfered'].edge_index = torch.stack([src, dst], dim=0)
         else:
             print(f"基站 {bs} 缺少有效连接关系，跳过该子图")
@@ -337,8 +373,6 @@ def generate_topology(N, K, pl_exponent=3.0, region_size=1.0, Nt=4):
         'region_size': region_size
     }
 
-
-# 可视化函数保持不变（同原plot_topology）
 
 if __name__ == "__main__":
     # 生成拓扑
