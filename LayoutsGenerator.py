@@ -1,74 +1,75 @@
 import numpy as np
 import networkx as nx
 import scipy.io as sio
-from torch_geometric.data import Data
+from torch_geometric.data import HeteroData
 import torch
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle, Circle
 
 
-def save_as_mat(result, filename):
-    """ 保存拓扑数据到MAT文件 """
-    mat_data = {
-        'bs_positions': result['positions_bs'],
-        'ue_positions': result['positions_users'],
-        'service_loss': result['service_losses'],
-        'interference_loss': result['interference_losses'],
-        'pl_exponent': np.array([result['pl_exponent']]),
-        'cell_size': np.array(result['cell_size']),
-        'region_size': np.array([result['region_size']])
-    }
-    sio.savemat(filename, mat_data)
+def generate_MISO_channel(distance, pl_exponent, Nt=4):
+    """ 生成MISO信道向量（含实部虚部分解） """
+    # 计算路径损耗
+    path_loss = (distance + 2) ** (-pl_exponent)
+    # 生成小尺度瑞利衰落
+    h_small = (np.random.randn(Nt) + 1j * np.random.randn(Nt)) / np.sqrt(2)
+    # 组合信道响应
+    h_total = path_loss * h_small
+    # 分离实部虚部：前Nt个为实值，后Nt个为虚部值
+    return np.stack([h_total.real, h_total.imag]).flatten()
 
 
-def convert_to_pyg(result):
-    """ 转换为PyG图数据 """
-    G = result['graph']
+def plot_pyg_topology(pyg_data):
+    """ 可视化PyG数据的拓扑连接关系（力导向布局） """
+    G = nx.Graph()
 
-    # 节点特征矩阵
-    node_features = []
-    node_mapping = {}
-    for idx, node in enumerate(G.nodes(data=True)):
-        pos = node[1]['pos']
-        node_type = 0 if node[1]['type'] == 'BS' else 1
-        node_features.append([pos[0], pos[1], node_type])
-        node_mapping[node[0]] = idx
+    # 添加所有节点（BS和UE）
+    num_bs = pyg_data['BS'].x.shape[0]
+    num_ue = pyg_data['UE'].x.shape[0]
 
-    # 边信息
-    edge_index = []
-    edge_attr = []
-    for u, v, data in G.edges(data=True):
-        src = node_mapping[u]
-        dst = node_mapping[v]
-        edge_index.append([src, dst])
-        edge_attr.append([
-            data['loss'],
-            0 if data['type'] == 'service' else 1,
-            data['distance']
-        ])
+    # 创建节点
+    G.add_nodes_from([(f"BS{i}", {"type": "BS"}) for i in range(num_bs)])
+    G.add_nodes_from([(f"UE{i}", {"type": "UE"}) for i in range(num_ue)])
 
-    # 转换为Tensor
-    return Data(
-        x=torch.tensor(node_features, dtype=torch.float),
-        edge_index=torch.tensor(edge_index, dtype=torch.long).t().contiguous(),
-        edge_attr=torch.tensor(edge_attr, dtype=torch.float),
-        y=torch.tensor([result['pl_exponent']], dtype=torch.float)
-    )
+    # 添加服务边
+    service_edges = pyg_data['BS', 'service', 'UE'].edge_index.t().tolist()
+    for src, dst in service_edges:
+        G.add_edge(f"BS{src}", f"UE{dst}", edge_type='service')
 
+    # 添加干扰边（如果有）
+    if ('BS', 'interf', 'UE') in pyg_data.edge_types:
+        interf_edges = pyg_data['BS', 'interf', 'UE'].edge_index.t().tolist()
+        for src, dst in interf_edges:
+            G.add_edge(f"BS{src}", f"UE{dst}", edge_type='interf')
 
-def analyze_topology(result):
-    """ 拓扑分析报告 """
-    print(f"路径损耗指数: {result['pl_exponent']}")
-    print(f"服务信道数量: {len(result['service_losses'])}")
-    print(f"干扰信道数量: {len(result['interference_losses'])}")
-    print("\n服务信道损耗统计:")
-    print(f"均值: {np.mean(result['service_losses']):.2e}")
-    print(f"最大值: {np.max(result['service_losses']):.2e}")
-    print(f"最小值: {np.min(result['service_losses']):.2e}")
-    print("\n干扰信道损耗统计:")
-    print(f"均值: {np.mean(result['interference_losses']):.2e}")
-    print(f"最大值: {np.max(result['interference_losses']):.2e}")
-    print(f"最小值: {np.min(result['interference_losses']):.2e}")
+    # 生成布局
+    pos = nx.spring_layout(G, seed=42)
+
+    # 绘制图形
+    plt.figure(figsize=(12, 8))
+
+    # 绘制节点
+    bs_nodes = [n for n in G.nodes if 'BS' in n]
+    ue_nodes = [n for n in G.nodes if 'UE' in n]
+
+    nx.draw_networkx_nodes(G, pos, nodelist=bs_nodes, node_size=300,
+                           node_color='red', edgecolors='black', label='BS')
+    nx.draw_networkx_nodes(G, pos, nodelist=ue_nodes, node_size=80,
+                           node_color='blue', alpha=0.6, label='UE')
+
+    # 绘制边
+    service_edges = [(u, v) for u, v, d in G.edges(data=True) if d['edge_type'] == 'service']
+    interf_edges = [(u, v) for u, v, d in G.edges(data=True) if d['edge_type'] == 'interf']
+
+    nx.draw_networkx_edges(G, pos, edgelist=service_edges, edge_color='green',
+                           width=1.5, alpha=0.6, label='Service Links')
+    nx.draw_networkx_edges(G, pos, edgelist=interf_edges, edge_color='gray',
+                           style='dotted', alpha=0.4, label='Interference Links')
+
+    plt.legend()
+    plt.title("Network Topology Connection Patterns")
+    plt.axis('off')
+    plt.show()
 
 
 def plot_topology(result):
@@ -104,8 +105,8 @@ def plot_topology(result):
                            node_color='blue', alpha=0.6)
 
     # 绘制带透明度的边
-    service_edges = [(u, v) for u, v, attr in G.edges(data=True) if attr['type'] == 'service']
-    interference_edges = [(u, v) for u, v, attr in G.edges(data=True) if attr['type'] == 'interference']
+    service_edges = [(u, v) for u, v, attr in G.edges(data=True) if attr['edge_type'] == 'service']
+    interference_edges = [(u, v) for u, v, attr in G.edges(data=True) if attr['edge_type'] == 'interf']
 
     nx.draw_networkx_edges(G, pos, edgelist=service_edges, edge_color='green',
                            width=1.5, alpha=0.6)
@@ -121,23 +122,141 @@ def plot_topology(result):
     plt.show()
 
 
-def calculate_path_loss(distance, pl_exponent):
-    """ 计算路径损耗 """
-    # return distance ** (-pl_exponent)
-    return (distance + 2) ** (-pl_exponent)  # xjc: +2 是为了防止过近造成太大
+def save_as_mat(result, filename):
+    """ 保存拓扑数据到 MAT文件（更新版） """
+    mat_data = {
+        'bs_positions': result['positions_bs'],
+        'ue_positions': result['positions_users'],
+        'service_channels': result['service_channels'],
+        'interference_channels': result['interference_channels'],
+        'pl_exponent': np.array([result['pl_exponent']]),
+        'cell_size': np.array(result['cell_size']),
+        'region_size': np.array([result['region_size']]),
+        'Nt': np.array([result['Nt']])
+    }
+    sio.savemat(filename, mat_data)
 
 
-def generate_topology(N, K, pl_exponent=3.0, region_size=1.0):
+def global_convert_to_pyg(result):
+    """ 转换为PyG异构图数据（支持MISO信道） """
+    data = HeteroData()
+    G = result['graph']
+    Nt = result['Nt']
+
+    # 分离BS和UE节点，并创建映射字典
+    bs_nodes = [n for n, attr in G.nodes(data=True) if attr['type'] == 'BS']
+    ue_nodes = [n for n, attr in G.nodes(data=True) if attr['type'] == 'UE']
+
+    bs_mapping = {node: idx for idx, node in enumerate(bs_nodes)}
+    ue_mapping = {node: idx for idx, node in enumerate(ue_nodes)}
+
+    # 添加节点特征 (初始设为全1向量)
+    data['BS'].x = torch.ones(len(bs_nodes), Nt, dtype=torch.float)  # 形状 [num_BS, Nt]
+    data['UE'].x = torch.ones(len(ue_nodes), Nt, dtype=torch.float)  # 形状 [num_UE, Nt]
+
+    # 处理边信息
+    service_edges, service_attrs = [], []
+    interf_edges, interf_attrs = [], []
+
+    for u, v, attr in G.edges(data=True):
+        if attr['edge_type'] == 'service':
+            # 转换节点名为索引
+            src_idx = bs_mapping[u]
+            dst_idx = ue_mapping[v]
+            service_edges.append((src_idx, dst_idx))
+            service_attrs.append(attr['channel'])
+        elif attr['edge_type'] == 'interf':
+            src_idx = bs_mapping[u]
+            dst_idx = ue_mapping[v]
+            interf_edges.append((src_idx, dst_idx))
+            interf_attrs.append(attr['channel'])
+
+    # 添加边到异构图
+    if len(service_edges) > 0:
+        service_edges = torch.tensor(service_edges).t().contiguous()  # 形状 [2, Num_service_edges]
+        data['BS', 'service', 'UE'].edge_index = service_edges
+        data['BS', 'service', 'UE'].edge_attr = torch.tensor(
+            np.array(service_attrs), dtype=torch.float
+        )
+
+    if len(interf_edges) > 0:
+        interf_edges = torch.tensor(interf_edges).t().contiguous()  # 形状 [2, Num_interf_edges]
+        data['BS', 'interf', 'UE'].edge_index = interf_edges
+        data['BS', 'interf', 'UE'].edge_attr = torch.tensor(
+            np.array(interf_attrs), dtype=torch.float
+        )
+
+    return data
+
+
+def cell_convert_to_pyg(topology):
+    """ 将拓扑数据转换为基站级别的子图列表 """
+    G = topology['graph']
+    subgraphs = []
+
+    # 获取所有基站节点
+    bs_nodes = [n for n, attr in G.nodes(data=True) if attr['type'] == 'BS']
+
+    for bs in bs_nodes:
+        # 创建异构图数据
+        hetero_data = HeteroData()
+
+        # 获取当前基站的服务用户和干扰用户
+        service_ues = [v for _, v, d in G.out_edges(bs, data=True) if d['edge_type'] == 'service']
+        interf_ues = [v for _, v, d in G.out_edges(bs, data=True) if d['edge_type'] == 'interf']
+
+        # 收集节点特征
+        served_feats = [G[bs][ue]['channel'] for ue in service_ues]
+        interf_feats = [G[bs][ue]['channel'] for ue in interf_ues]
+
+        # 添加节点
+        hetero_data['served'].x = torch.tensor(served_feats, dtype=torch.float)
+        hetero_data['interfered'].x = torch.tensor(interf_feats, dtype=torch.float)
+
+        # 创建全连接边（不同类节点间）
+        if len(service_ues) > 0 and len(interf_ues) > 0:
+            src = torch.arange(len(service_ues)).repeat_interleave(len(interf_ues))
+            dst = torch.arange(len(interf_ues)).repeat(len(service_ues))
+
+            hetero_data['served', 'conn', 'interfered'].edge_index = torch.stack([src, dst], dim=0)
+        else:
+            print(f"基站 {bs} 缺少有效连接关系，跳过该子图")
+            continue  # 跳过该子图
+
+        subgraphs.append(hetero_data)
+
+    return subgraphs
+
+
+def analyze_topology(result):
+    """ 拓扑分析报告 """
+    print(f"天线数量（Nt）: {result['Nt']}")
+    print(f"服务链路数量: {len(result['service_channels'])}")
+    print(f"干扰链路数量: {len(result['interference_channels'])}")
+    print(f"注：一个链路定义为Nt个负信道的集合，包含2*Nt个值，前Nt个为实部值，后Nt个为虚部值")
+
+    # 信道功率统计
+    service_power = [np.mean(np.abs(c) ** 2) for c in result['service_channels']]
+    interf_power = [np.mean(np.abs(c) ** 2) for c in result['interference_channels']]
+
+    print("\n服务链路功率统计:")
+    print(f"均值: {np.mean(service_power):.2e}")
+    print(f"最大值: {np.max(service_power):.2e}")
+    print(f"最小值: {np.min(service_power):.2e}")
+
+    print("\n干扰链路功率统计:")
+    print(f"均值: {np.mean(interf_power):.2e}")
+    print(f"最大值: {np.max(interf_power):.2e}")
+    print(f"最小值: {np.min(interf_power):.2e}")
+
+
+def generate_topology(N, K, pl_exponent=3.0, region_size=1.0, Nt=4):
     """
-    生成带路径损耗的通信系统拓扑
-    参数：
-        pl_exponent: 路径损耗指数（默认3.0）
-        interference_radius: 干扰半径（覆盖范围）
-        region_size: 区域尺寸
-    返回：
-        包含拓扑数据和损耗信息的字典
+    生成MISO系统拓扑
+    新增参数：
+        Nt: 基站天线数量
     """
-    # 生成基站网格布局
+    # 基站布局计算保持不变
     rows = int(np.ceil(np.sqrt(N)))
     cols = rows
     while rows * cols < N:
@@ -145,118 +264,138 @@ def generate_topology(N, K, pl_exponent=3.0, region_size=1.0):
 
     dx = region_size / (cols * 2)
     dy = region_size / (rows * 2)
+    interference_radius = dx / 1.5 * 10 ** (2 / pl_exponent)
 
-    # 设：pathloss为小区边界的100倍的区域为基站覆盖范围边界
-    # 根据 R_inf = R_cell * 10^ (2/n) 计算，也可以适度调整
-    # interference_radius = dx * 10 ** (2 / pl_exponent)
-    interference_radius = dx/1.5 * 10 ** (2 / pl_exponent)  # 设pathloss为小区边界2/3处的100倍的区域为基站覆盖范围边界
+    # 生成基站和用户坐标
+    positions_bs = np.array([(dx * (2 * i + 1), dy * (2 * j + 1)) for i in range(cols) for j in range(rows)][:N])
+    positions_users = np.random.uniform(0, region_size, (N * K, 2))  # 生成全域随机用户
 
-    # 生成基站坐标
-    positions_bs = np.array([
-                                (dx * (2 * i + 1), dy * (2 * j + 1))
-                                for i in range(cols) for j in range(rows)
-                            ][:N])
+    # 生成用户坐标（高斯分布）
+    # positions_users = np.zeros((N * K, 2))
+    # sigma = 0.1 * region_size  # 高斯分布标准差
+    # for bs_idx in range(N):
+    #     # 每个基站生成K个用户
+    #     start_idx = bs_idx * K
+    #     end_idx = start_idx + K
+    #     # 以基站位置为中心生成高斯分布坐标
+    #     positions_users[start_idx:end_idx] = np.random.normal(
+    #         loc=positions_bs[bs_idx],
+    #         scale=sigma,
+    #         size=(K, 2)
+    #     )
+    # # 限制用户坐标在区域范围内
+    # positions_users = np.clip(positions_users, 0, region_size)
 
-    # 生成全域随机用户
-    positions_users = np.random.uniform(0, region_size, (N * K, 2))
-
-    # 计算用户归属关系
-    grid_x = (positions_users[:, 0] // (2 * dx)).astype(int)
-    grid_y = (positions_users[:, 1] // (2 * dy)).astype(int)
-    grid_x = np.clip(grid_x, 0, cols - 1)
-    grid_y = np.clip(grid_y, 0, rows - 1)
+    # 用户归属计算保持不变
+    grid_x = (positions_users[:, 0] // (2 * dx)).astype(int).clip(0, cols - 1)
+    grid_y = (positions_users[:, 1] // (2 * dy)).astype(int).clip(0, rows - 1)
     associations = (grid_x * rows + grid_y).clip(max=N - 1)
 
-    # 计算所有基站与用户的距离矩阵
-    dist_matrix = np.linalg.norm(
-        positions_bs[:, np.newaxis, :] - positions_users[np.newaxis, :, :],
-        axis=2
-    )
+    # 距离矩阵计算
+    dist_matrix = np.linalg.norm(positions_bs[:, np.newaxis, :] - positions_users[np.newaxis, :, :], axis=2)
 
     # 构建网络图
     G = nx.DiGraph()
+    [G.add_node(f"BS{bs_idx}", pos=pos, type='BS') for bs_idx, pos in enumerate(positions_bs)]
+    [G.add_node(f"UE{ue_idx}", pos=pos, type='UE') for ue_idx, pos in enumerate(positions_users)]
 
-    # 添加节点
-    for bs_idx, pos in enumerate(positions_bs):
-        G.add_node(f"BS{bs_idx}", pos=pos, type='BS')
-    for user_idx, pos in enumerate(positions_users):
-        G.add_node(f"UE{user_idx}", pos=pos, type='UE')
-
-    # 添加服务边及损耗
-    service_losses = []
+    # 服务信道生成
+    service_channels = []
     for ue_idx, bs_idx in enumerate(associations):
         distance = np.linalg.norm(positions_bs[bs_idx] - positions_users[ue_idx])
-        loss = calculate_path_loss(distance, pl_exponent)
+        channel = generate_MISO_channel(distance, pl_exponent, Nt)
         G.add_edge(f"BS{bs_idx}", f"UE{ue_idx}",
-                   type='service', loss=loss, distance=distance)
-        service_losses.append(loss)
+                   edge_type='service',  # 0表示服务信道
+                   distance=distance,
+                   channel=channel)
+        service_channels.append(channel)
 
-    # 添加干扰边及损耗
-    interference_edges = []
-    interference_losses = []
+    # 干扰信道生成
+    interference_channels = []
     for ue_idx in range(len(positions_users)):
         serving_bs = associations[ue_idx]
-        valid_bs = np.where(
-            (dist_matrix[:, ue_idx] <= interference_radius) &
-            (np.arange(len(positions_bs)) != serving_bs)
-        )[0]
-        for bs_idx in valid_bs:
+        for bs_idx in \
+        np.where((dist_matrix[:, ue_idx] <= interference_radius) & (np.arange(len(positions_bs)) != serving_bs))[0]:
             distance = dist_matrix[bs_idx, ue_idx]
-            loss = calculate_path_loss(distance, pl_exponent)
+            channel = generate_MISO_channel(distance, pl_exponent, Nt)
             G.add_edge(f"BS{bs_idx}", f"UE{ue_idx}",
-                       type='interference', loss=loss, distance=distance)
-            interference_edges.append((bs_idx, ue_idx))
-            interference_losses.append(loss)
+                       edge_type='interf',  # 1表示干扰信道
+                       distance=distance,
+                       channel=channel)
+            interference_channels.append(channel)
 
     return {
         'positions_bs': positions_bs,
         'positions_users': positions_users,
         'graph': G,
-        'service_losses': np.array(service_losses),
-        'interference_losses': np.array(interference_losses),
+        'service_channels': np.array(service_channels),
+        'interference_channels': np.array(interference_channels),
         'pl_exponent': pl_exponent,
+        'Nt': Nt,
         'interference_radius': interference_radius,
         'cell_size': (2 * dx, 2 * dy),
         'region_size': region_size
     }
 
 
-# 示例用法
 if __name__ == "__main__":
     # 生成拓扑
     topology = generate_topology(
         N=16,
         K=6,
-        pl_exponent=5,  # 常取3~4
-        region_size=120
+        pl_exponent=4,
+        region_size=120,
+        Nt=4
     )
 
     analyze_topology(topology)
     plot_topology(topology)
 
-    # 保存为MAT文件
-    save_as_mat(topology, "cellular_topology.mat")
+    # 保存数据
+    save_as_mat(topology, "miso_topology.mat")
 
     # 转换为PyG数据
-    pyg_data = convert_to_pyg(topology)
+    pyg_data = global_convert_to_pyg(topology)
 
-    # 验证数据
-    print("\nPyG图数据信息:")
-    print(f"节点数量: {pyg_data.num_nodes}")
-    print(f"边数量: {pyg_data.num_edges}")
-    print(f"节点特征维度: {pyg_data.x.shape}")
-    print(f"边特征维度: {pyg_data.edge_attr.shape}")
-    print("\n节点特征示例:")
-    print(pyg_data.x[:3])  # 显示前3个节点
-    print("\n边特征示例:")
-    print(pyg_data.edge_attr[:3])  # 显示前3条边
+    # 转换为子图列表
+    cell_graphs = cell_convert_to_pyg(topology)
+    print(f"\n生成基站子图数量: {len(cell_graphs)}")
+    for i, g in enumerate(cell_graphs):
+        print(f"子图{i}: 服务用户数={g['served'].x.shape[0] if 'served' in g.node_types else 0}, "
+              f"干扰用户数={g['interfered'].x.shape[0] if 'interfered' in g.node_types else 0}")
 
-    # 可视化Data：从 Data 对象重建 NetworkX 图（适用于动态生成的 Data）
-    edge_index = pyg_data.edge_index.numpy().T  # 转换为边列表
-    G_from_pyg = nx.Graph()
-    G_from_pyg.add_edges_from(edge_index)
+    # 可视化PyG数据 (将PyG数据转换回networkx，再次检查拓扑关系)
+    plot_pyg_topology(pyg_data)
 
-    fig, ax = plt.subplots(figsize=(6, 4))  # 创建 Figure 和 Axes
-    nx.draw(G_from_pyg, ax=ax, with_labels=True, node_color='lightblue', edge_color='gray')  # 指定 ax 参数
-    plt.title("Visualization from PyG Data")
-    plt.show()
+    # 验证PyG全局图数据维度
+    print("\n验证PyG数据维度（全局）")
+
+    # 验证节点特征维度
+    print("BS节点特征维度:", pyg_data['BS'].x.shape)  # 应输出 torch.Size([16, 4])
+    print("UE节点特征维度:", pyg_data['UE'].x.shape)  # 应输出 torch.Size([96, 4])
+
+    # 验证边数据
+    service_edge_index = pyg_data['BS', 'service', 'UE'].edge_index
+    service_edge_attr = pyg_data['BS', 'service', 'UE'].edge_attr
+    interf_edge_index = pyg_data['BS', 'interf', 'UE'].edge_index
+    interf_edge_attr = pyg_data['BS', 'interf', 'UE'].edge_attr
+
+    print("\n服务边索引维度:", service_edge_index.shape)  #  torch.Size([2, num_Hs])
+    print("服务边属性维度:", service_edge_attr.shape)  #  torch.Size([num_Hs, num_Hs_real + num_Hs_imag])
+    print("\n干扰边索引维度:", interf_edge_index.shape)  #  torch.Size([2, num_Hi])
+    print("干扰边属性维度:", interf_edge_attr.shape)  #  torch.Size([num_Hi, num_Hi_real + num_Hi_imag])
+
+    # 验证信道特征数值
+    print("\n服务边属性示例（前3条）:")
+    print(service_edge_attr[:3])
+    print("干扰边属性示例（前3条）:")
+    print(interf_edge_attr[:3])
+
+    # 验证边连接有效性
+    print("\n服务边源节点范围:", service_edge_index[0].min().item(), "-",
+          service_edge_index[0].max().item())  # 应全在 0-num_BS 之间
+    print("服务边目标节点范围:", service_edge_index[1].min().item(), "-",
+          service_edge_index[1].max().item())  # 应全在 0-num_UE 之间
+    print("干扰边源节点范围:", interf_edge_index[0].min().item(), "-", interf_edge_index[0].max().item())  # 应全在 0-Num_BS 之间
+    print("干扰边目标节点范围:", interf_edge_index[1].min().item(), "-",
+          interf_edge_index[1].max().item())  # 应全在 0-num_UE*4 之间
