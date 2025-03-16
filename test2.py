@@ -7,6 +7,48 @@ from torch_geometric.loader import DataLoader
 import LayoutsGenerator as LG
 
 
+def compute_Sum_SLNR_rate(output: torch.Tensor, direct_h: torch.Tensor, interf_h: torch.Tensor) -> torch.Tensor:
+    slnr_value = compute_SLNR(output, direct_h, interf_h)  # 能一一对应吗？
+    slnr_rate = torch.log2(1 + slnr_value)
+    sum_slnr_rate = torch.sum(slnr_rate)
+    loss = torch.neg(sum_slnr_rate)
+    return loss
+
+
+def compute_SLNR(output: torch.Tensor, direct_h: torch.Tensor, interf_h: torch.Tensor) -> torch.Tensor:
+    # Nt = direct_h.size(1) // 2  # 获取天线数Nt
+    Nt = Nt_num
+
+    # 将实虚部分转换为复数tensor
+    def to_complex(t: torch.Tensor):
+        real = t[..., :Nt]
+        imag = t[..., Nt:]
+        return real + 1j * imag
+
+    output_c = to_complex(output)
+    direct_h_c = to_complex(direct_h)
+    interf_h_c = to_complex(interf_h)
+
+    results = []
+    num_served_users = output_c.size(0)
+
+    for served_idx in range(num_served_users):
+        # 计算分子：|h^H u|²
+        numerator = torch.abs(torch.sum(torch.conj(direct_h_c[served_idx]) * output_c[served_idx])) ** 2
+
+        # 计算分母：Σ|interf_h^H u|² + N0（N0设为1e-8）
+        denominator = N0
+        for interf_user in interf_h_c:
+            term = torch.abs(torch.sum(torch.conj(interf_user) * output_c[served_idx])) ** 2
+            denominator += term
+
+        # 计算(numerator / denominator)
+        slnr = numerator / denominator
+        results.append(slnr)
+
+    return torch.stack(results).unsqueeze(1)  # 转为[服务用户数, 1]维度
+
+
 def MLP(channels, batch_norm=True):
     return Seq(*[
         Seq(Lin(channels[i - 1], channels[i]), ReLU())#, BN(channels[i])
@@ -33,7 +75,7 @@ class HeteroGConv(MessagePassing):  # 边聚合
     def update(self, aggr_out, x):
         """ 节点更新 """
         src = x[1]
-        tmp = torch.cat([src, aggr_out], dim=1)  # 这里x_i在首轮迭代中数值太小了
+        tmp = torch.cat([src, aggr_out], dim=1)
         update = self.update_mlp(tmp)
         return update
 
@@ -62,7 +104,7 @@ class FDGNN(nn.Module):
             'interfered': data['interfered'].x
         }
         edge_index_dict = data.edge_index_dict
-        print(edge_index_dict)
+        # print(edge_index_dict)
 
 
         # 消息传递
@@ -89,6 +131,7 @@ if __name__ == "__main__":
 
     Batchsize_per_BS = 8  # 取值应可被Layouts_num整除
     graph_embedding_size = 8
+    N0 = 1e-12
 
     # 生成拓扑结构
     topology = LG.generate_topology(
@@ -105,8 +148,8 @@ if __name__ == "__main__":
 
     # 加载图数据为批次
     '''数据集导入见OneNote'''
-    train_loader = DataLoader(subgraph_list, batch_size=BS_num_per_Layout * Batchsize_per_BS, shuffle=False,
-                              num_workers=0)
+    # train_loader = DataLoader(subgraph_list, batch_size=BS_num_per_Layout * Batchsize_per_BS, shuffle=False,
+    #                           num_workers=0)
     # 禁止重排序是为了更好模拟各layout数量（按layout进行规范化的）
     # 合成一张大图，但各子图互不相连
     # 不能用DataLoader，子图形状不定，后面计算本地损失函数时没法拆分，而且索引可能有误
@@ -114,12 +157,53 @@ if __name__ == "__main__":
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = FDGNN().to(device)
     # model = torch.compile(model)  # torch 2.0.1可以进行编译优化,but Windows not yet supported for torch.compile
-
-    print("end")
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.002)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.9)
 
     # 前向传播
+    batch_size = BS_num_per_Layout * Batchsize_per_BS
+    num_epochs = 10
+
     # for data in train_loader:
-    for data in subgraph_list:
-        data = data.to(device)
-        output = model(data)
-        print(f"输出维度: {output.shape}")  # 应为 torch.Size([1, 1])
+    # for data in subgraph_list:
+    #     data = data.to(device)
+    #     output = model(data)
+    #     # print(f"输出维度: {output.shape}")
+    #     direct_h = data['served'].original_channel
+    #     interf_h = data['interfered'].original_channel
+    #     loss = compute_Sum_SLNR_rate(output, direct_h, interf_h)
+
+    for epoch in range(num_epochs):
+        epoch_loss = 0.0
+        num_batches = len(subgraph_list) // batch_size + (1 if len(subgraph_list) % batch_size != 0 else 0)
+        for batch_idx in range(num_batches):
+            batch_start = batch_idx * batch_size
+            batch_end = min(batch_start + batch_size, len(subgraph_list))
+            batch_data = subgraph_list[batch_start:batch_end]
+            batch_loss = 0.0
+            optimizer.zero_grad()
+
+            for data in batch_data:
+                data = data.to(device)
+                output = model(data)
+                direct_h = data['served'].original_channel
+                interf_h = data['interfered'].original_channel
+                loss = compute_Sum_SLNR_rate(output, direct_h, interf_h)
+                # loss.backward()
+                batch_loss += loss
+            batch_loss.backward()  # batch's sum_loss
+
+            optimizer.step()
+
+            print(f'Epoch {epoch + 1}/{num_epochs}, Batch {batch_idx + 1}/{num_batches}, Loss: {batch_loss.item()}')
+            epoch_loss += batch_loss
+
+            # 更新学习率
+        scheduler.step()
+
+        # 打印每个 epoch 的平均损失
+        print(f'Epoch {epoch + 1}/{num_epochs}, Average Loss: {epoch_loss / len(subgraph_list)}')
+
+    print('Training finished.')
+
+
