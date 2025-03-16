@@ -19,7 +19,7 @@ class HeteroGConv(MessagePassing):  # 边聚合
     def __init__(self, mlp_m, mlp_u):
         super().__init__(aggr='sum')
         # super().__init__(aggr='max')
-        self.msg_mlp = mlp_m  # 这样写其实会使参数在内存冗余
+        self.msg_mlp = mlp_m
         self.update_mlp = mlp_u
 
     def forward(self, x_dict, edge_index):
@@ -30,9 +30,11 @@ class HeteroGConv(MessagePassing):  # 边聚合
         msg = self.msg_mlp(x_j)
         return msg
 
-    def update(self, aggr_out):
+    def update(self, aggr_out, x):
         """ 节点更新 """
-        update = self.update_mlp(aggr_out)
+        src = x[1]
+        tmp = torch.cat([src, aggr_out], dim=1)  # 这里x_i在首轮迭代中数值太小了
+        update = self.update_mlp(tmp)
         return update
 
 
@@ -40,17 +42,13 @@ class FDGNN(nn.Module):
     """ 参数共享的联邦GNN """
     def __init__(self):
         super().__init__()
-        self.mlp_m = MLP([2 * Nt_num, 32, 2 * Nt_num])
-        self.mlp_u = MLP([2 * Nt_num, 16, 2 * Nt_num])  # 参数共享,参数待调整
+        self.mlp_m = MLP([2 * Nt_num, 32, 32])
+        self.mlp_u = MLP([32 + 2 * Nt_num, 32, 2 * Nt_num])  # 参数共享,参数待调整
         self.hconv_edge = HeteroGConv(self.mlp_m, self.mlp_u)
         self.hconv = HeteroConv({
             ('served', 'conn', 'interfered'): self.hconv_edge,
             ('interfered', 'conn', 'served'): self.hconv_edge
         })
-        # self.hconv = HeteroConv({
-        #     ('served', 'conn', 'interfered'): HeteroGConv(self.mlp_m, self.mlp_u),
-        #     ('interfered', 'conn', 'served'): HeteroGConv(self.mlp_m, self.mlp_u)
-        # }, aggr='sum')
         self.h2o = Seq(Lin(2 * Nt_num, 2 * Nt_num, bias=True), Tanh())
 
         # self.h2o = MLP([graph_embedding_size, 16])
@@ -108,7 +106,7 @@ if __name__ == "__main__":
     # 加载图数据为批次
     '''数据集导入见OneNote'''
     train_loader = DataLoader(subgraph_list, batch_size=BS_num_per_Layout * Batchsize_per_BS, shuffle=False,
-                              num_workers=4)
+                              num_workers=0)
     # 禁止重排序是为了更好模拟各layout数量（按layout进行规范化的）
     # 合成一张大图，但各子图互不相连
     # 不能用DataLoader，子图形状不定，后面计算本地损失函数时没法拆分，而且索引可能有误
@@ -120,7 +118,8 @@ if __name__ == "__main__":
     print("end")
 
     # 前向传播
-    for data in train_loader:
+    # for data in train_loader:
+    for data in subgraph_list:
         data = data.to(device)
         output = model(data)
         print(f"输出维度: {output.shape}")  # 应为 torch.Size([1, 1])
