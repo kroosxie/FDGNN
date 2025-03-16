@@ -217,8 +217,9 @@ def cell_convert_to_pyg(topology):
         if len(service_ues) > 0 and len(interf_ues) > 0:
             src = torch.arange(len(service_ues)).repeat_interleave(len(interf_ues))
             dst = torch.arange(len(interf_ues)).repeat(len(service_ues))
-
             hetero_data['served', 'conn', 'interfered'].edge_index = torch.stack([src, dst], dim=0)
+            hetero_data['interfered', 'conn', 'served'].edge_index = torch.stack([dst, src],
+                                                                                 dim=0)  # 增加反向边，变为无向图（其实是一个二分图）
         else:
             print(f"基站 {bs} 缺少有效连接关系，跳过该子图")
             continue  # 跳过该子图

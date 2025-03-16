@@ -5,6 +5,7 @@ from torch_geometric.data import HeteroData
 import torch
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle, Circle
+import torch_geometric.transforms as T
 
 
 def generate_MISO_channel(distance, pl_exponent, Nt=4):
@@ -255,10 +256,12 @@ def cell_convert_to_pyg(topology):
             src = torch.arange(len(service_ues)).repeat_interleave(len(interf_ues))
             dst = torch.arange(len(interf_ues)).repeat(len(service_ues))
             hetero_data['served', 'conn', 'interfered'].edge_index = torch.stack([src, dst], dim=0)
+            hetero_data['interfered', 'conn', 'served'].edge_index = torch.stack([dst, src], dim=0)  # 增加反向边，变为无向图（其实是一个二分图）
         else:
             print(f"基站 {bs} 缺少有效连接关系，跳过该子图")
             continue  # 跳过该子图
 
+        # hetero_data = T.ToUndirected()(hetero_data)  # 直接转为无向图，与增加反向边是一样的
         subgraphs.append(hetero_data)
 
     return subgraphs
