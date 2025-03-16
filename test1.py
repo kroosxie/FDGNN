@@ -227,7 +227,7 @@ def cell_convert_to_pyg(topology):
         service_ues = [v for _, v, d in G.out_edges(bs, data=True) if d['edge_type'] == 'service']
         interf_ues = [v for _, v, d in G.out_edges(bs, data=True) if d['edge_type'] == 'interf']
 
-        # 收集节点特征（真实信达数据）
+        # 收集节点特征（真实信道数据）
         served_feats = [G[bs][ue]['channel'] for ue in service_ues]
         interf_feats = [G[bs][ue]['channel'] for ue in interf_ues]
 
@@ -235,20 +235,20 @@ def cell_convert_to_pyg(topology):
         # 服务用户节点特征处理
         if len(served_feats) > 0:
             served_normalized = (served_feats - mean) / std
-            hetero_data['served'].x = torch.tensor(served_normalized)
+            hetero_data['served'].x = torch.tensor(served_normalized, dtype=torch.float)
             hetero_data['served'].original_channel = torch.tensor(served_feats)
         else:
             # 处理空节点情况，保持特征维度一致
-            hetero_data['served'].x = torch.empty((0, all_channels.shape[1]))
+            hetero_data['served'].x = torch.empty((0, all_channels.shape[1]), dtype=torch.float)
             hetero_data['served'].original_channel = torch.empty((0, all_channels.shape[1]))
 
         # 干扰用户节点特征处理
         if len(interf_feats) > 0:
             interf_normalized = (interf_feats - mean) / std
-            hetero_data['interfered'].x = torch.tensor(interf_normalized)
+            hetero_data['interfered'].x = torch.tensor(interf_normalized, dtype=torch.float)
             hetero_data['interfered'].original_channel = torch.tensor(interf_feats)
         else:
-            hetero_data['interfered'].x = torch.empty((0, all_channels.shape[1]))
+            hetero_data['interfered'].x = torch.empty((0, all_channels.shape[1]), dtype=torch.float)
             hetero_data['interfered'].original_channel = torch.empty((0, all_channels.shape[1]))
 
         # 构建全连接边 （不同类节点间）

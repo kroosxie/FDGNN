@@ -234,20 +234,20 @@ def cell_convert_to_pyg(topology):
         # 服务用户节点特征处理
         if len(served_feats) > 0:
             served_normalized = (served_feats - mean) / std
-            hetero_data['served'].x = torch.tensor(served_normalized)
+            hetero_data['served'].x = torch.tensor(served_normalized, dtype=torch.float)
             hetero_data['served'].original_channel = torch.tensor(served_feats)
         else:
             # 处理空节点情况，保持特征维度一致
-            hetero_data['served'].x = torch.empty((0, all_channels.shape[1]))
+            hetero_data['served'].x = torch.empty((0, all_channels.shape[1]), dtype=torch.float)
             hetero_data['served'].original_channel = torch.empty((0, all_channels.shape[1]))
 
         # 干扰用户节点特征处理
         if len(interf_feats) > 0:
             interf_normalized = (interf_feats - mean) / std
-            hetero_data['interfered'].x = torch.tensor(interf_normalized)
+            hetero_data['interfered'].x = torch.tensor(interf_normalized, dtype=torch.float)
             hetero_data['interfered'].original_channel = torch.tensor(interf_feats)
         else:
-            hetero_data['interfered'].x = torch.empty((0, all_channels.shape[1]))
+            hetero_data['interfered'].x = torch.empty((0, all_channels.shape[1]), dtype=torch.float)
             hetero_data['interfered'].original_channel = torch.empty((0, all_channels.shape[1]))
 
         # 构建全连接边 （不同类节点间）
