@@ -233,9 +233,10 @@ def cell_convert_to_pyg(topology):
         # 规范化处理 ----------------------------------------------------------
         # 服务用户节点特征处理
         if len(served_feats) > 0:
-            served_normalized = (served_feats - mean) / std
+            served_feats_np = np.array(served_feats)
+            served_normalized = (served_feats_np - mean) / std
             hetero_data['served'].x = torch.tensor(served_normalized, dtype=torch.float)
-            hetero_data['served'].original_channel = torch.tensor(served_feats)
+            hetero_data['served'].original_channel = torch.tensor(served_feats_np)
         else:
             # 处理空节点情况，保持特征维度一致
             hetero_data['served'].x = torch.empty((0, all_channels.shape[1]), dtype=torch.float)
@@ -243,9 +244,10 @@ def cell_convert_to_pyg(topology):
 
         # 干扰用户节点特征处理
         if len(interf_feats) > 0:
-            interf_normalized = (interf_feats - mean) / std
+            interf_feats_np = np.array(interf_feats)
+            interf_normalized = (interf_feats_np - mean) / std
             hetero_data['interfered'].x = torch.tensor(interf_normalized, dtype=torch.float)
-            hetero_data['interfered'].original_channel = torch.tensor(interf_feats)
+            hetero_data['interfered'].original_channel = torch.tensor(interf_feats_np)
         else:
             hetero_data['interfered'].x = torch.empty((0, all_channels.shape[1]), dtype=torch.float)
             hetero_data['interfered'].original_channel = torch.empty((0, all_channels.shape[1]))
