@@ -150,7 +150,8 @@ class FDGNN(nn.Module):
         # )
 
         self.bf_output = Seq(Lin(2 * Nt_num, 2 * Nt_num), Tanh(),  # 角度部分，实部虚部均归一化为[-1, 1]
-            PowerConstraintLayer(Nt_num, P_max_per_antenna_norm=1))  # 对各天线的发射功率约束
+            PowerConstraintLayer(Nt_num, P_max_per_antenna_norm=1))  # 对各天线的最大发射功率约束为单位1
+        # 自己设计的，等于将以原点为中心的正方形的可行域化为单位圆
 
 
         # self.h2o = MLP([graph_embedding_size, 16])
@@ -164,8 +165,6 @@ class FDGNN(nn.Module):
             'interfered': data['interfered'].x
         }
         edge_index_dict = data.edge_index_dict
-        # print(edge_index_dict)
-
 
         # 消息传递
         x1_dict = self.hconv(x0_dict, edge_index_dict)
