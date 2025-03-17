@@ -2,9 +2,10 @@ import torch
 from torch_geometric.nn import HeteroConv, MessagePassing
 from torch_geometric.data import HeteroData
 from torch import nn
-from torch.nn import Sequential as Seq, Linear as Lin, ReLU, Sigmoid, Tanh, LeakyReLU, BatchNorm1d as BN
+from torch.nn import Sequential as Seq, Linear as Lin, ReLU, Sigmoid, Tanh, LeakyReLU, BatchNorm1d as BN, Softmax
 from torch_geometric.loader import DataLoader
 import LayoutsGenerator as LG
+import numpy as np
 
 
 def compute_Sum_SLNR_rate(output: torch.Tensor, direct_h: torch.Tensor, interf_h: torch.Tensor) -> torch.Tensor:
@@ -56,6 +57,50 @@ def MLP(channels, batch_norm=True):
     ])
 
 
+# class PowerNormalization(nn.Module):
+#     def __init__(self, P_max=1.0, eps=1e-8):
+#         super().__init__()
+#         self.P_max = P_max
+#         self.eps = eps
+#
+#     def forward(self, W_raw):
+#         # 输入形状: (K, 2*Nt)
+#         real = W_raw[..., :W_raw.shape[-1] // 2]  # 实部
+#         imag = W_raw[..., W_raw.shape[-1] // 2:]  # 虚部
+#         # 计算总功率 (batch_size, 1, 1)
+#         power = torch.sum(real ** 2 + imag ** 2, dim=(-2, -1), keepdim=True)
+#         # 计算缩放因子
+#         scaling = torch.sqrt(self.P_max / (power + self.eps))
+#         # 缩放并合并
+#         real_norm = real * scaling
+#         imag_norm = imag * scaling
+#         return torch.cat([real_norm, imag_norm], dim=-1)
+
+
+class PowerConstraintLayer(nn.Module):
+    def __init__(self, Nt_num, P_max_per_antenna_norm):
+        super().__init__()
+        self.Nt_num = Nt_num
+        self.P_max_per_antenna_norm = P_max_per_antenna_norm
+
+    def forward(self, Beamforming_Matrix):
+        num_antennas = self.Nt_num
+        real_part = Beamforming_Matrix[:, :num_antennas]
+        imag_part = Beamforming_Matrix[:, num_antennas:]
+        complex_part = real_part + 1j * imag_part
+
+        norms = torch.norm(complex_part, dim=0)  # 计算每列的范数
+        mask = norms > self.P_max_per_antenna_norm
+        scale_factors = torch.where(mask,
+                                    self.P_max_per_antenna_norm / norms,
+                                    torch.ones_like(norms))
+
+        scaled_real = real_part * scale_factors
+        scaled_imag = imag_part * scale_factors
+
+        return torch.cat([scaled_real, scaled_imag], dim=1)
+
+
 class HeteroGConv(MessagePassing):  # 边聚合
     """ 参数共享的异构消息传递层 """
     def __init__(self, mlp_m, mlp_u):
@@ -91,7 +136,22 @@ class FDGNN(nn.Module):
             ('served', 'conn', 'interfered'): self.hconv_edge,
             ('interfered', 'conn', 'served'): self.hconv_edge
         })
-        self.h2o = Seq(Lin(2 * Nt_num, 2 * Nt_num, bias=True), Tanh())
+        # self.h2o = Seq(Lin(2 * Nt_num, 2 * Nt_num, bias=True), Tanh())
+        # self.h2o = Seq(Lin(2 * Nt_num, 2 * Nt_num, bias=True), PowerNormalization(P_max))
+
+        # 输出层拆分为角度和功率两部分
+        # self.angle_output = Seq(Lin(2 * Nt_num, Nt_num), Tanh())  # 角度范围 [-1, 1]，后续映射到 [-pi, pi]
+        # self.power_output = Seq(Lin(2 * Nt_num, Nt_num), ReLU())  # 功率非负
+        # self.power_output = Seq(Lin(2 * Nt_num, Nt_num), Sigmoid())  # 对每天线进行功率约束,错误
+        # self.power_output = Seq(
+        #     Lin(2 * Nt_num, Nt_num),
+        #     Sigmoid(),
+        #     PowerConstraintLayer(Nt_num, P_max_per_antenna=1)
+        # )
+
+        self.bf_output = Seq(Lin(2 * Nt_num, 2 * Nt_num), Tanh(),  # 角度部分，实部虚部均归一化为[-1, 1]
+            PowerConstraintLayer(Nt_num, P_max_per_antenna_norm=1))  # 对各天线的发射功率约束
+
 
         # self.h2o = MLP([graph_embedding_size, 16])
         # self.h2o = Seq(*[self.h2o, Seq(Lin(16, 1, bias=True), Tanh())])
@@ -112,8 +172,18 @@ class FDGNN(nn.Module):
         x2_dict = self.hconv(x1_dict, edge_index_dict)  # 边上后续可加注意力
         out_dict = self.hconv(x2_dict, edge_index_dict)
 
-        out_bfv_dict = out_dict['served']  # 在served_UE节点上输出beamforming_vector
-        Beamforming_Matrix = self.h2o(out_bfv_dict)  # 注意功率约束
+        out_bfm = out_dict['served']  # 在served_UE节点上输出beamforming_vector
+        # Beamforming_Matrix = self.h2o(out_bfm)  # 注意功率约束
+        Beamforming_Matrix = self.bf_output(out_bfm)
+
+        # 输出角度和功率
+        # angles = self.angle_output(out_bfm) * np.pi  # 映射到 [-pi, pi]
+        # powers = self.power_output(out_bfm)
+        # # 组合成复数波束成形向量
+        # real_part = powers * torch.cos(angles)
+        # imag_part = powers * torch.sin(angles)
+        # Beamforming_Matrix = torch.cat((real_part, imag_part), dim=1)
+
         # p_view = torch.norm(Beamforming_Matrix)
         # print("\nBS's T_power_norm: ", p_view)
 
@@ -134,6 +204,7 @@ if __name__ == "__main__":
     Batchsize_per_BS = 4  # 取值应可被Layouts_num整除
     graph_embedding_size = 8
     N0 = 1e-12
+    P_max = 6
 
     # 生成拓扑结构
     topology = LG.generate_topology(
@@ -164,7 +235,7 @@ if __name__ == "__main__":
 
     # 前向传播
     batch_size = BS_num_per_Layout * Batchsize_per_BS
-    num_epochs = 20
+    num_epochs = 80
 
     # for data in train_loader:
     # for data in subgraph_list:
