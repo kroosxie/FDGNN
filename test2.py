@@ -2,7 +2,7 @@ import torch
 from torch_geometric.nn import HeteroConv, MessagePassing
 from torch_geometric.data import HeteroData
 from torch import nn
-from torch.nn import Sequential as Seq, Linear as Lin, ReLU, Sigmoid, Tanh
+from torch.nn import Sequential as Seq, Linear as Lin, ReLU, Sigmoid, Tanh, LeakyReLU, BatchNorm1d as BN
 from torch_geometric.loader import DataLoader
 import LayoutsGenerator as LG
 
@@ -51,7 +51,7 @@ def compute_SLNR(output: torch.Tensor, direct_h: torch.Tensor, interf_h: torch.T
 
 def MLP(channels, batch_norm=True):
     return Seq(*[
-        Seq(Lin(channels[i - 1], channels[i]), ReLU())#, BN(channels[i])
+        Seq(Lin(channels[i - 1], channels[i]), LeakyReLU())#, BN(channels[i]))  # ReLU改为了LeakyReLU, 加入了BN
         for i in range(1, len(channels))
     ])
 
@@ -114,6 +114,8 @@ class FDGNN(nn.Module):
 
         out_bfv_dict = out_dict['served']  # 在served_UE节点上输出beamforming_vector
         Beamforming_Matrix = self.h2o(out_bfv_dict)  # 注意功率约束
+        # p_view = torch.norm(Beamforming_Matrix)
+        # print("\nBS's T_power_norm: ", p_view)
 
         return Beamforming_Matrix
 
@@ -129,7 +131,7 @@ if __name__ == "__main__":
     Region_size = 120 * (Layouts_num ** 0.5)  # Layout生成区域边长,注意与小区数匹配
     Nt_num = 4  # MISO信道发射天线数
 
-    Batchsize_per_BS = 8  # 取值应可被Layouts_num整除
+    Batchsize_per_BS = 4  # 取值应可被Layouts_num整除
     graph_embedding_size = 8
     N0 = 1e-12
 
@@ -162,7 +164,7 @@ if __name__ == "__main__":
 
     # 前向传播
     batch_size = BS_num_per_Layout * Batchsize_per_BS
-    num_epochs = 10
+    num_epochs = 20
 
     # for data in train_loader:
     # for data in subgraph_list:
