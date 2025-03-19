@@ -8,6 +8,113 @@ import LayoutsGenerator as LG
 import numpy as np
 
 
+def compute_Sum_SINR_rate(output_list, topology):
+    # 将每个基站的输出转换为复数波束成形矩阵
+    Nt = topology['Nt']
+    beamforming_matrices = []
+    for output in output_list:
+        real_part = output[:, :Nt]
+        imag_part = output[:, Nt:]
+        w_complex = real_part + 1j * imag_part
+        beamforming_matrices.append(w_complex)
+
+    # 获取用户到服务基站的关联关系
+    graph = topology['graph']
+    num_users = len(topology['positions_users'])
+    associations = []
+    for ue_idx in range(num_users):
+        ue_node = f"UE{ue_idx}"
+        found = False
+        for pred in graph.predecessors(ue_node):  # 获得前驱节点（指向us_node的节点）
+            edge_data = graph.get_edge_data(pred, ue_node)
+            if edge_data.get('edge_type') == 'service':
+                bs_idx = int(pred[2:])  # 提取基站索引，例如"BS0" -> 0
+                associations.append(bs_idx)
+                found = True
+                break
+        if not found:
+            raise ValueError(f"User {ue_idx} has no serving base station")
+    associations = np.array(associations)
+
+    # 为每个基站构建其服务的用户索引列表
+    num_bs = len(topology['positions_bs'])
+    bs_user_indices = [[] for _ in range(num_bs)]
+    for ue_idx, bs_idx in enumerate(associations):
+        bs_user_indices[bs_idx].append(ue_idx)
+
+    # 获取服务信道（每个用户到其服务基站的信道）
+    service_channels = topology['service_channels']  # 形状 (num_users, 2 * Nt)
+    sc_real = service_channels[:, :Nt]
+    sc_imag = service_channels[:, Nt:]
+    service_channels_complex = sc_real + 1j * sc_imag
+
+    # 噪声功率设定，这里假设为1，可根据实际情况调整
+    sigma2 = N0
+
+    sum_rate = 0.0
+    for ue_idx in range(num_users):
+        # 当前用户的服务基站
+        serving_bs = associations[ue_idx]
+        # 在服务基站的波束成形矩阵中找到该用户的索引
+        try:
+            user_pos = bs_user_indices[serving_bs].index(ue_idx)
+        except ValueError:
+            raise ValueError(f"User {ue_idx} not found in BS {serving_bs}'s user list")
+
+        # 服务基站的波束成形矩阵
+        w_serving = beamforming_matrices[serving_bs]
+        w_serving = w_serving.to('cpu').numpy()  # 训练时估计有误，会没有梯度
+        # 当前用户的波束向量
+        w_u = w_serving[user_pos]
+        # 当前用户到服务基站的信道
+        h_serving = service_channels_complex[ue_idx]
+
+        # 计算信号功率
+        signal = np.vdot(h_serving, w_u)
+        S = np.abs(signal) ** 2
+
+        # 同小区干扰（来自同一基站的其他用户）
+        intra_interference = 0.0
+        for idx, w_other in enumerate(w_serving):
+            if idx != user_pos:
+                interf = np.vdot(h_serving, w_other)
+                intra_interference += np.abs(interf) ** 2
+
+        # 跨小区干扰（来自其他基站）
+        inter_interference = 0.0
+        ue_node = f"UE{ue_idx}"
+        # 遍历所有干扰基站的入边
+        for pred in graph.predecessors(ue_node):
+            edge_data = graph.get_edge_data(pred, ue_node)
+            if edge_data.get('edge_type') == 'interf':
+                interf_bs = int(pred[2:])  # 干扰基站索引
+                # 干扰信道
+                h_interf = edge_data['channel']
+                h_real = h_interf[:Nt]
+                h_imag = h_interf[Nt:]
+                h_interf_complex = h_real + 1j * h_imag
+                # 干扰基站的波束成形矩阵
+                w_i = beamforming_matrices[interf_bs].to('cpu')
+                w_interf = w_i.numpy()
+                # 累加该基站所有用户的干扰
+                for w_other in w_interf:
+                    interf = np.vdot(h_interf_complex, w_other)
+                    inter_interference += np.abs(interf) ** 2
+
+        # 总干扰加噪声
+        total_interference = intra_interference + inter_interference + sigma2
+
+        # 计算SINR和速率
+        if total_interference == 0:
+            sinr = 0.0
+        else:
+            sinr = S / total_interference
+        rate = np.log2(1 + sinr)
+        sum_rate += rate
+
+    return sum_rate
+
+
 def compute_Sum_SLNR_rate(output: torch.Tensor, direct_h: torch.Tensor, interf_h: torch.Tensor) -> torch.Tensor:
     slnr_value = compute_SLNR(output, direct_h, interf_h)  # 能一一对应吗？
     slnr_rate = torch.log2(1 + slnr_value)
@@ -37,11 +144,19 @@ def compute_SLNR(output: torch.Tensor, direct_h: torch.Tensor, interf_h: torch.T
         # 计算分子：|h^H u|²
         numerator = torch.abs(torch.sum(torch.conj(direct_h_c[served_idx]) * output_c[served_idx])) ** 2
 
-        # 计算分母：Σ|interf_h^H u|² + N0（N0设为1e-8）
+        # Noise
         denominator = N0
+
+        # 组内干扰
+        mask = torch.arange(direct_h_c.size(0)) != served_idx
+        for inter_interf_user in direct_h_c[mask]:
+            term_inter = torch.abs(torch.sum(torch.conj(inter_interf_user) * output_c[served_idx])) ** 2
+            denominator += term_inter
+
+        # 组间干扰 Σ|interf_h^H u|²
         for interf_user in interf_h_c:
-            term = torch.abs(torch.sum(torch.conj(interf_user) * output_c[served_idx])) ** 2
-            denominator += term
+            term_intra = torch.abs(torch.sum(torch.conj(interf_user) * output_c[served_idx])) ** 2  # 共轭转置
+            denominator += term_intra
 
         # 计算(numerator / denominator)
         slnr = numerator / denominator
@@ -151,7 +266,7 @@ class FDGNN(nn.Module):
 
         self.bf_output = Seq(Lin(2 * Nt_num, 2 * Nt_num), Tanh(),  # 角度部分，实部虚部均归一化为[-1, 1]
             PowerConstraintLayer(Nt_num, P_max_per_antenna_norm=1))  # 对各天线的最大发射功率约束为单位1
-        # 自己设计的，等于将以原点为中心的正方形的可行域化为单位圆
+        # 自己设计的输出层，等于将以原点为中心的正方形的可行域化为单位圆
 
 
         # self.h2o = MLP([graph_embedding_size, 16])
@@ -171,9 +286,8 @@ class FDGNN(nn.Module):
         x2_dict = self.hconv(x1_dict, edge_index_dict)  # 边上后续可加注意力
         out_dict = self.hconv(x2_dict, edge_index_dict)
 
-        out_bfm = out_dict['served']  # 在served_UE节点上输出beamforming_vector
-        # Beamforming_Matrix = self.h2o(out_bfm)  # 注意功率约束
-        Beamforming_Matrix = self.bf_output(out_bfm)
+        out_bfm = out_dict['served']  # 在served_UE节点上输出对应beamforming_vector
+        Beamforming_Matrix = self.bf_output(out_bfm)  # 对各天线的最大发射功率进行约束
 
         # 输出角度和功率
         # angles = self.angle_output(out_bfm) * np.pi  # 映射到 [-pi, pi]
@@ -189,6 +303,30 @@ class FDGNN(nn.Module):
         return Beamforming_Matrix
 
 
+def train():
+    total_loss = 0.0
+    num_batches = len(subgraph_list) // batch_size + (1 if len(subgraph_list) % batch_size != 0 else 0)
+    for batch_idx in range(num_batches):
+        batch_start = batch_idx * batch_size
+        batch_end = min(batch_start + batch_size, len(subgraph_list))
+        batch_data = subgraph_list[batch_start:batch_end]
+        batch_loss = 0.0
+        optimizer.zero_grad()
+        for data in batch_data:
+            data = data.to(device)
+            output = model(data)
+            direct_h = data['served'].original_channel
+            interf_h = data['interfered'].original_channel
+            loss = compute_Sum_SLNR_rate(output, direct_h, interf_h)
+            # loss.backward()
+            batch_loss += loss
+        batch_loss.backward()  # batch's sum_loss
+        optimizer.step()
+        print(f'Epoch {epoch + 1}/{num_epochs}, Batch {batch_idx + 1}/{num_batches}, Loss: {batch_loss.item()}')
+        total_loss += batch_loss
+    return total_loss
+
+
 # 使用示例
 if __name__ == "__main__":
     # 初始化参数
@@ -202,7 +340,7 @@ if __name__ == "__main__":
 
     Batchsize_per_BS = 4  # 取值应可被Layouts_num整除
     graph_embedding_size = 8
-    N0 = 1e-12
+    N0 = 1e-10
     P_max = 6
 
     # 生成拓扑结构
@@ -228,54 +366,62 @@ if __name__ == "__main__":
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = FDGNN().to(device)
-    # model = torch.compile(model)  # torch 2.0.1可以进行编译优化,but Windows not yet supported for torch.compile
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.002)
+    # model = torch.compile(model)  # torch 2.0.1可以进行编译优化, but Windows not yet supported for torch.compile
+    # optimizer = torch.optim.Adam(model.parameters(), lr=0.002)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.9)
 
     # 前向传播
     batch_size = BS_num_per_Layout * Batchsize_per_BS
-    num_epochs = 80
+    num_epochs = 1
 
-    # for data in train_loader:
-    # for data in subgraph_list:
-    #     data = data.to(device)
-    #     output = model(data)
-    #     # print(f"输出维度: {output.shape}")
-    #     direct_h = data['served'].original_channel
-    #     interf_h = data['interfered'].original_channel
-    #     loss = compute_Sum_SLNR_rate(output, direct_h, interf_h)
-
+    # 以subgraph的list为样本进行训练
     for epoch in range(num_epochs):
-        epoch_loss = 0.0
-        num_batches = len(subgraph_list) // batch_size + (1 if len(subgraph_list) % batch_size != 0 else 0)
-        for batch_idx in range(num_batches):
-            batch_start = batch_idx * batch_size
-            batch_end = min(batch_start + batch_size, len(subgraph_list))
-            batch_data = subgraph_list[batch_start:batch_end]
-            batch_loss = 0.0
-            optimizer.zero_grad()
-
-            for data in batch_data:
-                data = data.to(device)
-                output = model(data)
-                direct_h = data['served'].original_channel
-                interf_h = data['interfered'].original_channel
-                loss = compute_Sum_SLNR_rate(output, direct_h, interf_h)
-                # loss.backward()
-                batch_loss += loss
-            batch_loss.backward()  # batch's sum_loss
-
-            optimizer.step()
-
-            print(f'Epoch {epoch + 1}/{num_epochs}, Batch {batch_idx + 1}/{num_batches}, Loss: {batch_loss.item()}')
-            epoch_loss += batch_loss
-
-            # 更新学习率
-        scheduler.step()
-
-        # 打印每个 epoch 的平均损失
+        model.train()
+        epoch_loss = train()
+        scheduler.step()  # 更新学习率,可暂时不选
         print(f'Epoch {epoch + 1}/{num_epochs}, Average Loss: {epoch_loss / len(subgraph_list)}')
 
     print('Training finished.')
+
+
+    # test data generator
+    topology_test = LG.generate_topology(
+        N=BS_num_per_Layout, K=avg_UE_num,
+        pl_exponent=PathLoss_exponent,
+        region_size=Region_size,
+        Nt=Nt_num
+    )
+    subgraph_list_test = LG.cell_convert_to_pyg(topology_test)
+    global_graph_test = LG.global_convert_to_pyg(topology_test)
+
+    # test
+    model.eval()
+    output_list = []
+    with torch.no_grad():
+        for data in subgraph_list_test:
+            layout_sum_loss = 0
+            layout_sum_rate = 0
+            data = data.to(device)
+            output = model(data)
+            output_list.append(output)
+            direct_h = data['served'].original_channel
+            interf_h = data['interfered'].original_channel
+            loss = compute_Sum_SLNR_rate(output, direct_h, interf_h)
+            layout_sum_loss += loss
+        layout_sum_rate = compute_Sum_SINR_rate(output_list, topology_test)
+        # layout_sum_rate = compute_Sum_SINR_rate(output_list, global_graph_test)
+        print(f'Test Layout‘s sum loss：{layout_sum_loss}')
+        print(f'Test Layout‘s sum rate：{layout_sum_rate}')
+
+    print('Testing finished.')
+
+
+
+
+
+
+
+
 
 
