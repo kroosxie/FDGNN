@@ -123,6 +123,28 @@ def plot_topology(result):
     plt.show()
 
 
+def analyze_topology(result):
+    """ 拓扑分析报告 """
+    print(f"天线数量（Nt）: {result['Nt']}")
+    print(f"服务链路数量: {len(result['service_channels'])}")
+    print(f"干扰链路数量: {len(result['interference_channels'])}")
+    print(f"注：一个链路定义为Nt个负信道的集合，包含2*Nt个值，前Nt个为实部值，后Nt个为虚部值")
+
+    # 信道功率统计
+    service_power = [np.mean(np.abs(c) ** 2) for c in result['service_channels']]
+    interf_power = [np.mean(np.abs(c) ** 2) for c in result['interference_channels']]
+
+    print("\n服务链路功率统计:")
+    print(f"均值: {np.mean(service_power):.2e}")
+    print(f"最大值: {np.max(service_power):.2e}")
+    print(f"最小值: {np.min(service_power):.2e}")
+
+    print("\n干扰链路功率统计:")
+    print(f"均值: {np.mean(interf_power):.2e}")
+    print(f"最大值: {np.max(interf_power):.2e}")
+    print(f"最小值: {np.min(interf_power):.2e}")
+
+
 def save_as_mat(result, filename):
     """ 保存拓扑数据到 MAT文件（更新版） """
     mat_data = {
@@ -261,6 +283,7 @@ def cell_convert_to_pyg(topology):
             hetero_data['interfered', 'conn', 'served'].edge_index = torch.stack([dst, src], dim=0)  # 增加反向边，变为无向图（其实是一个二分图）
         else:
             print(f"基站 {bs} 缺少有效连接关系，跳过该子图")
+            # raise RuntimeError(f"基站 {bs} 缺少有效连接关系，错误")
             continue  # 跳过该子图
 
         # hetero_data = T.ToUndirected()(hetero_data)  # 直接转为无向图，与增加反向边是一样的
@@ -269,29 +292,7 @@ def cell_convert_to_pyg(topology):
     return subgraphs
 
 
-def analyze_topology(result):
-    """ 拓扑分析报告 """
-    print(f"天线数量（Nt）: {result['Nt']}")
-    print(f"服务链路数量: {len(result['service_channels'])}")
-    print(f"干扰链路数量: {len(result['interference_channels'])}")
-    print(f"注：一个链路定义为Nt个负信道的集合，包含2*Nt个值，前Nt个为实部值，后Nt个为虚部值")
-
-    # 信道功率统计
-    service_power = [np.mean(np.abs(c) ** 2) for c in result['service_channels']]
-    interf_power = [np.mean(np.abs(c) ** 2) for c in result['interference_channels']]
-
-    print("\n服务链路功率统计:")
-    print(f"均值: {np.mean(service_power):.2e}")
-    print(f"最大值: {np.max(service_power):.2e}")
-    print(f"最小值: {np.min(service_power):.2e}")
-
-    print("\n干扰链路功率统计:")
-    print(f"均值: {np.mean(interf_power):.2e}")
-    print(f"最大值: {np.max(interf_power):.2e}")
-    print(f"最小值: {np.min(interf_power):.2e}")
-
-
-def generate_topology(N, K, pl_exponent=3.0, region_size=1.0, Nt=4):
+def generate_topology(N, K, pl_exponent=3.0, region_size=1.0, Nt=4, max_attempts=100):
     """
     生成MISO系统拓扑
     新增参数：
@@ -307,76 +308,95 @@ def generate_topology(N, K, pl_exponent=3.0, region_size=1.0, Nt=4):
     dy = region_size / (rows * 2)
     interference_radius = dx / 1.5 * 10 ** (2 / pl_exponent)
 
-    # 生成基站和用户坐标
-    positions_bs = np.array([(dx * (2 * i + 1), dy * (2 * j + 1)) for i in range(cols) for j in range(rows)][:N])
-    positions_users = np.random.uniform(0, region_size, (N * K, 2))  # 生成全域随机用户
+    for attempt in range(max_attempts):
+        # 生成基站和用户坐标
+        positions_bs = np.array([(dx * (2 * i + 1), dy * (2 * j + 1)) for i in range(cols) for j in range(rows)][:N])
+        positions_users = np.random.uniform(0, region_size, (N * K, 2))  # 生成全域随机用户
 
-    # 生成用户坐标（高斯分布）
-    # positions_users = np.zeros((N * K, 2))
-    # sigma = 0.1 * region_size  # 高斯分布标准差
-    # for bs_idx in range(N):
-    #     # 每个基站生成K个用户
-    #     start_idx = bs_idx * K
-    #     end_idx = start_idx + K
-    #     # 以基站位置为中心生成高斯分布坐标
-    #     positions_users[start_idx:end_idx] = np.random.normal(
-    #         loc=positions_bs[bs_idx],
-    #         scale=sigma,
-    #         size=(K, 2)
-    #     )
-    # # 限制用户坐标在区域范围内
-    # positions_users = np.clip(positions_users, 0, region_size)
+        # 生成用户坐标（高斯分布）
+        # positions_users = np.zeros((N * K, 2))
+        # sigma = 0.1 * region_size  # 高斯分布标准差
+        # for bs_idx in range(N):
+        #     # 每个基站生成K个用户
+        #     start_idx = bs_idx * K
+        #     end_idx = start_idx + K
+        #     # 以基站位置为中心生成高斯分布坐标
+        #     positions_users[start_idx:end_idx] = np.random.normal(
+        #         loc=positions_bs[bs_idx],
+        #         scale=sigma,
+        #         size=(K, 2)
+        #     )
+        # # 限制用户坐标在区域范围内
+        # positions_users = np.clip(positions_users, 0, region_size)
 
-    # 用户归属计算保持不变
-    grid_x = (positions_users[:, 0] // (2 * dx)).astype(int).clip(0, cols - 1)
-    grid_y = (positions_users[:, 1] // (2 * dy)).astype(int).clip(0, rows - 1)
-    associations = (grid_x * rows + grid_y).clip(max=N - 1)
+        # 用户归属计算保持不变
+        grid_x = (positions_users[:, 0] // (2 * dx)).astype(int).clip(0, cols - 1)
+        grid_y = (positions_users[:, 1] // (2 * dy)).astype(int).clip(0, rows - 1)
+        associations = (grid_x * rows + grid_y).clip(max=N - 1)
 
-    # 距离矩阵计算
-    dist_matrix = np.linalg.norm(positions_bs[:, np.newaxis, :] - positions_users[np.newaxis, :, :], axis=2)
+        # 距离矩阵计算
+        dist_matrix = np.linalg.norm(positions_bs[:, np.newaxis, :] - positions_users[np.newaxis, :, :], axis=2)
 
-    # 构建网络图
-    G = nx.DiGraph()
-    [G.add_node(f"BS{bs_idx}", pos=pos, type='BS') for bs_idx, pos in enumerate(positions_bs)]
-    [G.add_node(f"UE{ue_idx}", pos=pos, type='UE') for ue_idx, pos in enumerate(positions_users)]
+        # 条件1: 检查每个基站都有服务用户
+        service_counts = np.bincount(associations, minlength=N)
+        if np.any(service_counts == 0):
+            continue  # 重新生成
 
-    # 服务信道生成
-    service_channels = []
-    for ue_idx, bs_idx in enumerate(associations):
-        distance = np.linalg.norm(positions_bs[bs_idx] - positions_users[ue_idx])
-        channel = generate_MISO_channel(distance, pl_exponent, Nt)
-        G.add_edge(f"BS{bs_idx}", f"UE{ue_idx}",
-                   edge_type='service',  # 0表示服务信道
-                   distance=distance,
-                   channel=channel)
-        service_channels.append(channel)
+        # 构建网络图
+        G = nx.DiGraph()
+        [G.add_node(f"BS{bs_idx}", pos=pos, type='BS') for bs_idx, pos in enumerate(positions_bs)]
+        [G.add_node(f"UE{ue_idx}", pos=pos, type='UE') for ue_idx, pos in enumerate(positions_users)]
 
-    # 干扰信道生成
-    interference_channels = []
-    for ue_idx in range(len(positions_users)):
-        serving_bs = associations[ue_idx]
-        for bs_idx in \
-        np.where((dist_matrix[:, ue_idx] <= interference_radius) & (np.arange(len(positions_bs)) != serving_bs))[0]:
-            distance = dist_matrix[bs_idx, ue_idx]
+        # 服务信道生成
+        service_channels = []
+        for ue_idx, bs_idx in enumerate(associations):
+            distance = np.linalg.norm(positions_bs[bs_idx] - positions_users[ue_idx])
             channel = generate_MISO_channel(distance, pl_exponent, Nt)
             G.add_edge(f"BS{bs_idx}", f"UE{ue_idx}",
-                       edge_type='interf',  # 1表示干扰信道
+                       edge_type='service',
                        distance=distance,
                        channel=channel)
-            interference_channels.append(channel)
+            service_channels.append(channel)
 
-    return {
-        'positions_bs': positions_bs,
-        'positions_users': positions_users,
-        'graph': G,
-        'service_channels': np.array(service_channels),
-        'interference_channels': np.array(interference_channels),
-        'pl_exponent': pl_exponent,
-        'Nt': Nt,
-        'interference_radius': interference_radius,
-        'cell_size': (2 * dx, 2 * dy),
-        'region_size': region_size
-    }
+        # 干扰信道生成
+        interference_channels = []
+        interf_counts = np.zeros(N, dtype=int)
+        for ue_idx in range(len(positions_users)):
+            serving_bs = associations[ue_idx]
+            for bs_idx in \
+            np.where((dist_matrix[:, ue_idx] <= interference_radius) & (np.arange(len(positions_bs)) != serving_bs))[0]:
+                distance = dist_matrix[bs_idx, ue_idx]
+                channel = generate_MISO_channel(distance, pl_exponent, Nt)
+                G.add_edge(f"BS{bs_idx}", f"UE{ue_idx}",
+                           edge_type='interf',
+                           distance=distance,
+                           channel=channel)
+                interference_channels.append(channel)
+                interf_counts[bs_idx] += 1  # 记录干扰次数
+
+        # 条件检查2：每个基站至少一个干扰用户
+        if np.any(interf_counts == 0):
+            continue  # 重新生成
+
+        return {
+            'positions_bs': positions_bs,
+            'positions_users': positions_users,
+            'graph': G,
+            'service_channels': np.array(service_channels),
+            'interference_channels': np.array(interference_channels),
+            'pl_exponent': pl_exponent,
+            'Nt': Nt,
+            'interference_radius': interference_radius,
+            'cell_size': (2 * dx, 2 * dy),
+            'region_size': region_size
+        }
+    # 超过最大尝试次数仍未满足条件
+    raise RuntimeError(
+        f"无法在{max_attempts}次尝试内生成有效拓扑。建议：\n"
+        f"1. 增大K值（当前K={K}）\n"
+        f"2. 扩大区域尺寸（当前region_size={region_size}）\n"
+        f"3. 减小路径损耗指数（当前pl_exponent={pl_exponent}）"
+    )
 
 
 if __name__ == "__main__":
