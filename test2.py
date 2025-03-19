@@ -306,6 +306,7 @@ class FDGNN(nn.Module):
 def train():
     total_loss = 0.0
     num_batches = len(subgraph_list) // batch_size + (1 if len(subgraph_list) % batch_size != 0 else 0)
+    output_list_train = []
     for batch_idx in range(num_batches):
         batch_start = batch_idx * batch_size
         batch_end = min(batch_start + batch_size, len(subgraph_list))
@@ -315,6 +316,7 @@ def train():
         for data in batch_data:
             data = data.to(device)
             output = model(data)
+            output_list_train.append(output.detach().cpu())
             direct_h = data['served'].original_channel
             interf_h = data['interfered'].original_channel
             loss = compute_Sum_SLNR_rate(output, direct_h, interf_h)
@@ -322,8 +324,10 @@ def train():
             batch_loss += loss
         batch_loss.backward()  # batch's sum_loss
         optimizer.step()
-        print(f'Epoch {epoch + 1}/{num_epochs}, Batch {batch_idx + 1}/{num_batches}, Loss: {batch_loss.item()}')
+        # print(f'Epoch {epoch + 1}/{num_epochs}, Batch {batch_idx + 1}/{num_batches}, Loss: {batch_loss.item()}')
         total_loss += batch_loss
+    batch_sum_rate = compute_Sum_SINR_rate(output_list_train, topology)
+    print(f'Epoch {epoch + 1}/{num_epochs}, Sum Rate (SINR): {batch_sum_rate.item()}')
     return total_loss
 
 
@@ -373,14 +377,14 @@ if __name__ == "__main__":
 
     # 前向传播
     batch_size = BS_num_per_Layout * Batchsize_per_BS
-    num_epochs = 1
+    num_epochs = 10
 
     # 以subgraph的list为样本进行训练
     for epoch in range(num_epochs):
         model.train()
         epoch_loss = train()
         scheduler.step()  # 更新学习率,可暂时不选
-        print(f'Epoch {epoch + 1}/{num_epochs}, Average Loss: {epoch_loss / len(subgraph_list)}')
+        print(f'Epoch {epoch + 1}/{num_epochs}, Average Loss (SLNR): {epoch_loss / len(subgraph_list)}')
 
     print('Training finished.')
 
@@ -415,13 +419,3 @@ if __name__ == "__main__":
         print(f'Test Layout‘s sum rate：{layout_sum_rate}')
 
     print('Testing finished.')
-
-
-
-
-
-
-
-
-
-
