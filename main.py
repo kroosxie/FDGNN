@@ -8,53 +8,50 @@ import LayoutsGenerator as LG
 import numpy as np
 
 
-def compute_Sum_SINR_rate(output_list, topology):
+def compute_Sum_SINR_rate_d(output_list, data):
+    # 获取设备
+    device = data['UE'].x.device
+
+    # 获取 Nt
+    Nt = data['BS', 'service', 'UE'].edge_attr.shape[1] // 2
+
     # 将每个基站的输出转换为复数波束成形矩阵
-    Nt = topology['Nt']
     beamforming_matrices = []
     for output in output_list:
         real_part = output[:, :Nt]
         imag_part = output[:, Nt:]
-        w_complex = real_part + 1j * imag_part
+        w_complex = torch.complex(real_part, imag_part)
         beamforming_matrices.append(w_complex)
 
     # 获取用户到服务基站的关联关系
-    graph = topology['graph']
-    num_users = len(topology['positions_users'])
-    associations = []
-    for ue_idx in range(num_users):
-        ue_node = f"UE{ue_idx}"
-        found = False
-        for pred in graph.predecessors(ue_node):  # 获得前驱节点（指向us_node的节点）
-            edge_data = graph.get_edge_data(pred, ue_node)
-            if edge_data.get('edge_type') == 'service':
-                bs_idx = int(pred[2:])  # 提取基站索引，例如"BS0" -> 0
-                associations.append(bs_idx)
-                found = True
-                break
-        if not found:
-            raise ValueError(f"User {ue_idx} has no serving base station")
-    associations = np.array(associations)
+    service_edge_index = data['BS', 'service', 'UE'].edge_index
+    num_users = data['UE'].x.shape[0]
+    associations = torch.zeros(num_users, dtype=torch.long, device=device)
+    for i in range(service_edge_index.shape[1]):
+        bs_idx = service_edge_index[0, i]
+        ue_idx = service_edge_index[1, i]
+        associations[ue_idx] = bs_idx
 
     # 为每个基站构建其服务的用户索引列表
-    num_bs = len(topology['positions_bs'])
+    num_bs = data['BS'].x.shape[0]
     bs_user_indices = [[] for _ in range(num_bs)]
     for ue_idx, bs_idx in enumerate(associations):
-        bs_user_indices[bs_idx].append(ue_idx)
+        bs_user_indices[bs_idx.item()].append(ue_idx)
 
     # 获取服务信道（每个用户到其服务基站的信道）
-    service_channels = topology['service_channels']  # 形状 (num_users, 2 * Nt)
+    # service_channels = data['BS', 'service', 'UE'].original_channel  # 按bs_idx顺序排列，有误，应按ue_idx排列
+    service_channels = data['UE', 'service', 'BS'].original_channel  # 按bs_idx顺序排列，有误，应按ue_idx排列
     sc_real = service_channels[:, :Nt]
     sc_imag = service_channels[:, Nt:]
-    service_channels_complex = sc_real + 1j * sc_imag
+    service_channels_complex = torch.complex(sc_real, sc_imag)
 
-    # 噪声功率设定，这里假设为1，可根据实际情况调整
-    sigma2 = N0
+    # 噪声功率
+    sigma2 = torch.tensor(N0, dtype=torch.float32, device=device)
 
-    sum_rate = 0.0
+    sum_rate = torch.tensor(0.0, dtype=torch.float32, requires_grad=True, device=device)
     for ue_idx in range(num_users):
         # 当前用户的服务基站
-        serving_bs = associations[ue_idx]
+        serving_bs = associations[ue_idx].item()
         # 在服务基站的波束成形矩阵中找到该用户的索引
         try:
             user_pos = bs_user_indices[serving_bs].index(ue_idx)
@@ -63,25 +60,118 @@ def compute_Sum_SINR_rate(output_list, topology):
 
         # 服务基站的波束成形矩阵
         w_serving = beamforming_matrices[serving_bs]
-        w_serving = w_serving.to('cpu').numpy()  # 训练时估计有误，会没有梯度
         # 当前用户的波束向量
         w_u = w_serving[user_pos]
         # 当前用户到服务基站的信道
         h_serving = service_channels_complex[ue_idx]
 
         # 计算信号功率
-        signal = np.vdot(h_serving, w_u)
-        S = np.abs(signal) ** 2
+        signal = torch.dot(h_serving.conj(), w_u)
+        S = torch.abs(signal) ** 2
 
         # 同小区干扰（来自同一基站的其他用户）
-        intra_interference = 0.0
+        intra_interference = torch.tensor(0.0, dtype=torch.float32, device=device)
         for idx, w_other in enumerate(w_serving):
             if idx != user_pos:
-                interf = np.vdot(h_serving, w_other)
-                intra_interference += np.abs(interf) ** 2
+                interf = torch.dot(h_serving.conj(), w_other)
+                intra_interference += torch.abs(interf) ** 2
 
         # 跨小区干扰（来自其他基站）
-        inter_interference = 0.0
+        inter_interference = torch.tensor(0.0, dtype=torch.float32, device=device)
+        ue_node = f"UE{ue_idx}"
+        # 遍历所有干扰基站的入边 （效率可能有点低）
+        interf_edge_index = data['BS', 'interf', 'UE'].edge_index
+        interf_edge_attr = data['BS', 'interf', 'UE'].original_channel
+        for i in range(interf_edge_index.shape[1]):  # 遍历所有干扰边
+            bs_idx = interf_edge_index[0, i].item()
+            target_ue_idx = interf_edge_index[1, i].item()
+            if target_ue_idx == ue_idx:
+                # 干扰信道
+                h_interf = interf_edge_attr[i]  # 第i条边，非直接取所有的干扰边，正确
+                h_real = h_interf[:Nt]
+                h_imag = h_interf[Nt:]
+                h_interf_complex = torch.complex(h_real, h_imag)
+                # 干扰基站的波束成形矩阵
+                w_i = beamforming_matrices[bs_idx]
+                # 累加该基站所有用户的干扰
+                for w_other in w_i:
+                    interf = torch.dot(h_interf_complex.conj(), w_other)
+                    inter_interference += torch.abs(interf) ** 2
+
+        # 总干扰加噪声
+        total_interference = intra_interference + inter_interference + sigma2
+
+        # 计算SINR和速率
+        if total_interference == 0:
+            sinr = torch.tensor(0.0, dtype=torch.float32, device=device)
+        else:
+            sinr = S / total_interference
+        rate = torch.log2(1 + sinr)
+        sum_rate = sum_rate + rate
+        loss = torch.neg(sum_rate)
+    return loss
+
+
+def compute_Sum_SINR_rate_t(output_list, topology):
+    # 将每个基站的输出转换为复数波束成形矩阵
+    Nt = topology['Nt']
+    beamforming_matrices = []
+    for output in output_list:
+        real_part = output[:, :Nt]
+        imag_part = output[:, Nt:]
+        w_complex = torch.complex(real_part, imag_part)
+        beamforming_matrices.append(w_complex)
+
+    # 获取用户到服务基站的关联关系
+    graph = topology['graph']
+    num_users = len(topology['positions_users'])
+    associations = torch.tensor(topology['associations'], dtype=torch.long, device=device)
+
+    # 为每个基站构建其服务的用户索引列表
+    num_bs = len(topology['positions_bs'])
+    bs_user_indices = [[] for _ in range(num_bs)]
+    for ue_idx, bs_idx in enumerate(associations):
+        bs_user_indices[bs_idx.item()].append(ue_idx)
+
+    # 获取服务信道（每个用户到其服务基站的信道）
+    service_channels = torch.tensor(topology['service_channels'], dtype=torch.float32, device=device)  # (num_users, 2 * Nt)， 按用户idx顺序排列
+    sc_real = service_channels[:, :Nt]
+    sc_imag = service_channels[:, Nt:]
+    service_channels_complex = torch.complex(sc_real, sc_imag)
+
+    # 噪声功率
+    sigma2 = torch.tensor(N0, dtype=torch.float32, device=device)
+
+    sum_rate = torch.tensor(0.0, dtype=torch.float32, requires_grad=True, device=device)
+    for ue_idx in range(num_users):
+        # 当前用户的服务基站
+        serving_bs = associations[ue_idx].item()
+        # 在服务基站的波束成形矩阵中找到该用户的索引
+        try:
+            user_pos = bs_user_indices[serving_bs].index(ue_idx)
+        except ValueError:
+            raise ValueError(f"User {ue_idx} not found in BS {serving_bs}'s user list")
+
+        # 服务基站的波束成形矩阵
+        w_serving = beamforming_matrices[serving_bs]
+        # 当前用户的波束向量
+        w_u = w_serving[user_pos]
+        # 当前用户到服务基站的信道
+        h_serving = service_channels_complex[ue_idx]
+
+        # 计算信号功率
+        signal = torch.dot(h_serving.conj(), w_u)
+        S = torch.abs(signal) ** 2
+
+        # 同小区干扰（来自同一基站的其他用户）
+        intra_interference = torch.tensor(0.0, dtype=torch.float32, device=device)
+        for idx, w_other in enumerate(w_serving):
+            if idx != user_pos:
+                interf = torch.dot(h_serving.conj(), w_other)
+                intra_interference += torch.abs(interf) ** 2
+
+        # 跨小区干扰（来自其他基站）
+        inter_interference = torch.tensor(0.0, dtype=torch.float32, device=device)
         ue_node = f"UE{ue_idx}"
         # 遍历所有干扰基站的入边
         for pred in graph.predecessors(ue_node):
@@ -89,28 +179,27 @@ def compute_Sum_SINR_rate(output_list, topology):
             if edge_data.get('edge_type') == 'interf':
                 interf_bs = int(pred[2:])  # 干扰基站索引
                 # 干扰信道
-                h_interf = edge_data['channel']
+                h_interf = torch.tensor(edge_data['channel'], dtype=torch.float32, device=device)
                 h_real = h_interf[:Nt]
                 h_imag = h_interf[Nt:]
-                h_interf_complex = h_real + 1j * h_imag
+                h_interf_complex = torch.complex(h_real, h_imag)
                 # 干扰基站的波束成形矩阵
-                w_i = beamforming_matrices[interf_bs].to('cpu')
-                w_interf = w_i.numpy()
+                w_i = beamforming_matrices[interf_bs]
                 # 累加该基站所有用户的干扰
-                for w_other in w_interf:
-                    interf = np.vdot(h_interf_complex, w_other)
-                    inter_interference += np.abs(interf) ** 2
+                for w_other in w_i:
+                    interf = torch.dot(h_interf_complex.conj(), w_other)
+                    inter_interference += torch.abs(interf) ** 2
 
         # 总干扰加噪声
         total_interference = intra_interference + inter_interference + sigma2
 
         # 计算SINR和速率
         if total_interference == 0:
-            sinr = 0.0
+            sinr = torch.tensor(0.0, dtype=torch.float32, device=device)
         else:
             sinr = S / total_interference
-        rate = np.log2(1 + sinr)
-        sum_rate += rate
+        rate = torch.log2(1 + sinr)
+        sum_rate = sum_rate + rate
 
     return sum_rate
 
@@ -227,15 +316,15 @@ class HeteroGConv(MessagePassing):  # 边聚合
     def forward(self, x_dict, edge_index):
         return self.propagate(edge_index, x=x_dict)
 
-    def message(self, x_i, x_j):
+    def message(self, x_i, x_j):  # x_j是各边的源节点（src）
         """ 消息生成 """
         msg = self.msg_mlp(x_j)
         return msg
 
     def update(self, aggr_out, x):
         """ 节点更新 """
-        src = x[1]
-        tmp = torch.cat([src, aggr_out], dim=1)
+        dst = x[1]
+        tmp = torch.cat([dst, aggr_out], dim=1)
         update = self.update_mlp(tmp)
         return update
 
@@ -275,10 +364,11 @@ class FDGNN(nn.Module):
 
     def forward(self, data: HeteroData):
         # 初始特征
-        x0_dict = {
-            'served': data['served'].x,
-            'interfered': data['interfered'].x
-        }
+        # x0_dict = {
+        #     'served': data['served'].x,
+        #     'interfered': data['interfered'].x
+        # }
+        x0_dict = data.x_dict
         edge_index_dict = data.edge_index_dict
 
         # 消息传递
@@ -326,7 +416,8 @@ def train():
         optimizer.step()
         # print(f'Epoch {epoch + 1}/{num_epochs}, Batch {batch_idx + 1}/{num_batches}, Loss: {batch_loss.item()}')
         total_loss += batch_loss
-    batch_sum_rate = compute_Sum_SINR_rate(output_list_train, topology)
+    batch_sum_rate = compute_Sum_SINR_rate_t(output_list_train, topology_train)
+
     print(f'Epoch {epoch + 1}/{num_epochs}, Sum Rate (SINR): {batch_sum_rate.item()}')
     return total_loss
 
@@ -345,10 +436,10 @@ if __name__ == "__main__":
     Batchsize_per_BS = 4  # 取值应可被Layouts_num整除
     graph_embedding_size = 8
     N0 = 1e-10
-    P_max = 6
+    # P_max = 6
 
     # 生成拓扑结构
-    topology = LG.generate_topology(
+    topology_train = LG.generate_topology(
         N=BS_num,
         K=avg_UE_num,
         pl_exponent=PathLoss_exponent,
@@ -358,7 +449,7 @@ if __name__ == "__main__":
 
     # 提取子图并转化为pyg异构图结构 (已包含数据标准化)
     '''数据标准化可能需要改进，具体见OneNote'''
-    subgraph_list = LG.cell_convert_to_pyg(topology)
+    subgraph_list = LG.cell_convert_to_pyg(topology_train)
 
     # 加载图数据为批次
     '''数据集导入见OneNote'''
@@ -397,7 +488,7 @@ if __name__ == "__main__":
         Nt=Nt_num
     )
     subgraph_list_test = LG.cell_convert_to_pyg(topology_test)
-    global_graph_test = LG.global_convert_to_pyg(topology_test)
+    global_graph_test = LG.global_convert_to_pyg(topology_test).to(device)
 
     # test
     model.eval()
@@ -413,9 +504,10 @@ if __name__ == "__main__":
             interf_h = data['interfered'].original_channel
             loss = compute_Sum_SLNR_rate(output, direct_h, interf_h)
             layout_sum_loss += loss
-        layout_sum_rate = compute_Sum_SINR_rate(output_list, topology_test)
-        # layout_sum_rate = compute_Sum_SINR_rate(output_list, global_graph_test)
+        layout_sum_rate = compute_Sum_SINR_rate_t(output_list, topology_test)
+        layout_sum_rate_d = compute_Sum_SINR_rate_d(output_list, global_graph_test)
         print(f'Test Layout‘s sum loss：{layout_sum_loss}')
-        print(f'Test Layout‘s sum rate：{layout_sum_rate}')
+        print(f'Test Layout‘s sum rate based topology：{layout_sum_rate}')
+        print(f'Test Layout‘s sum rate based pyg_data：{-layout_sum_rate_d}')  # 为什么不一样？
 
     print('Testing finished.')
