@@ -39,13 +39,14 @@ def compute_Sum_SINR_rate_d(output_list, data):
         bs_user_indices[bs_idx.item()].append(ue_idx)
 
     # 获取服务信道（每个用户到其服务基站的信道）
-    service_channels = data['BS', 'service', 'UE'].original_channel
+    # service_channels = data['BS', 'service', 'UE'].original_channel  # 按bs_idx顺序排列，有误，应按ue_idx排列
+    service_channels = data['UE', 'service', 'BS'].original_channel  # 按bs_idx顺序排列，有误，应按ue_idx排列
     sc_real = service_channels[:, :Nt]
     sc_imag = service_channels[:, Nt:]
     service_channels_complex = torch.complex(sc_real, sc_imag)
 
     # 噪声功率
-    sigma2 = torch.tensor(1e-10, dtype=torch.float32, device=device)
+    sigma2 = torch.tensor(N0, dtype=torch.float32, device=device)
 
     sum_rate = torch.tensor(0.0, dtype=torch.float32, requires_grad=True, device=device)
     for ue_idx in range(num_users):
@@ -78,15 +79,15 @@ def compute_Sum_SINR_rate_d(output_list, data):
         # 跨小区干扰（来自其他基站）
         inter_interference = torch.tensor(0.0, dtype=torch.float32, device=device)
         ue_node = f"UE{ue_idx}"
-        # 遍历所有干扰基站的入边
+        # 遍历所有干扰基站的入边 （效率可能有点低）
         interf_edge_index = data['BS', 'interf', 'UE'].edge_index
         interf_edge_attr = data['BS', 'interf', 'UE'].original_channel
-        for i in range(interf_edge_index.shape[1]):
+        for i in range(interf_edge_index.shape[1]):  # 遍历所有干扰边
             bs_idx = interf_edge_index[0, i].item()
             target_ue_idx = interf_edge_index[1, i].item()
             if target_ue_idx == ue_idx:
                 # 干扰信道
-                h_interf = interf_edge_attr[i]
+                h_interf = interf_edge_attr[i]  # 第i条边，非直接取所有的干扰边，正确
                 h_real = h_interf[:Nt]
                 h_imag = h_interf[Nt:]
                 h_interf_complex = torch.complex(h_real, h_imag)
@@ -134,7 +135,7 @@ def compute_Sum_SINR_rate_t(output_list, topology):
         bs_user_indices[bs_idx.item()].append(ue_idx)
 
     # 获取服务信道（每个用户到其服务基站的信道）
-    service_channels = torch.tensor(topology['service_channels'], dtype=torch.float32, device=device)  # 形状 (num_users, 2 * Nt)
+    service_channels = torch.tensor(topology['service_channels'], dtype=torch.float32, device=device)  # (num_users, 2 * Nt)， 按用户idx顺序排列
     sc_real = service_channels[:, :Nt]
     sc_imag = service_channels[:, Nt:]
     service_channels_complex = torch.complex(sc_real, sc_imag)
@@ -200,100 +201,6 @@ def compute_Sum_SINR_rate_t(output_list, topology):
             sinr = S / total_interference
         rate = torch.log2(1 + sinr)
         sum_rate = sum_rate + rate
-
-    return sum_rate
-
-
-def compute_Sum_SINR_rate_t_1(output_list, topology):
-    # 将每个基站的输出转换为复数波束成形矩阵
-    Nt = topology['Nt']
-    beamforming_matrices = []
-    for output in output_list:
-        real_part = output[:, :Nt]
-        imag_part = output[:, Nt:]
-        w_complex = real_part + 1j * imag_part
-        beamforming_matrices.append(w_complex)
-
-    # 获取用户到服务基站的关联关系
-    graph = topology['graph']
-    num_users = len(topology['positions_users'])
-    associations = topology['associations']
-
-    # 为每个基站构建其服务的用户索引列表
-    num_bs = len(topology['positions_bs'])
-    bs_user_indices = [[] for _ in range(num_bs)]
-    for ue_idx, bs_idx in enumerate(associations):
-        bs_user_indices[bs_idx].append(ue_idx)
-
-    # 获取服务信道（每个用户到其服务基站的信道）
-    service_channels = topology['service_channels']  # 形状 (num_users, 2 * Nt)
-    sc_real = service_channels[:, :Nt]
-    sc_imag = service_channels[:, Nt:]
-    service_channels_complex = sc_real + 1j * sc_imag
-
-    # 噪声功率
-    sigma2 = N0
-
-    sum_rate = 0.0
-    for ue_idx in range(num_users):
-        # 当前用户的服务基站
-        serving_bs = associations[ue_idx]
-        # 在服务基站的波束成形矩阵中找到该用户的索引
-        try:
-            user_pos = bs_user_indices[serving_bs].index(ue_idx)
-        except ValueError:
-            raise ValueError(f"User {ue_idx} not found in BS {serving_bs}'s user list")
-
-        # 服务基站的波束成形矩阵
-        w_serving = beamforming_matrices[serving_bs]
-        w_serving = w_serving.to('cpu').numpy()  # 训练时估计有误，会没有梯度
-        # 当前用户的波束向量
-        w_u = w_serving[user_pos]
-        # 当前用户到服务基站的信道
-        h_serving = service_channels_complex[ue_idx]
-
-        # 计算信号功率
-        signal = np.vdot(h_serving, w_u)  # 等同于np.sum(np.conj(h_serving) * w_u)
-        S = np.abs(signal) ** 2
-
-        # 同小区干扰（来自同一基站的其他用户）
-        intra_interference = 0.0
-        for idx, w_other in enumerate(w_serving):
-            if idx != user_pos:
-                interf = np.vdot(h_serving, w_other)
-                intra_interference += np.abs(interf) ** 2
-
-        # 跨小区干扰（来自其他基站）
-        inter_interference = 0.0
-        ue_node = f"UE{ue_idx}"
-        # 遍历所有干扰基站的入边
-        for pred in graph.predecessors(ue_node):
-            edge_data = graph.get_edge_data(pred, ue_node)
-            if edge_data.get('edge_type') == 'interf':
-                interf_bs = int(pred[2:])  # 干扰基站索引
-                # 干扰信道
-                h_interf = edge_data['channel']
-                h_real = h_interf[:Nt]
-                h_imag = h_interf[Nt:]
-                h_interf_complex = h_real + 1j * h_imag
-                # 干扰基站的波束成形矩阵
-                w_i = beamforming_matrices[interf_bs].to('cpu')
-                w_interf = w_i.numpy()
-                # 累加该基站所有用户的干扰
-                for w_other in w_interf:
-                    interf = np.vdot(h_interf_complex, w_other)
-                    inter_interference += np.abs(interf) ** 2
-
-        # 总干扰加噪声
-        total_interference = intra_interference + inter_interference + sigma2
-
-        # 计算SINR和速率
-        if total_interference == 0:
-            sinr = 0.0
-        else:
-            sinr = S / total_interference
-        rate = np.log2(1 + sinr)
-        sum_rate += rate
 
     return sum_rate
 
@@ -599,11 +506,9 @@ if __name__ == "__main__":
             loss = compute_Sum_SLNR_rate(output, direct_h, interf_h)
             layout_sum_loss += loss
         layout_sum_rate = compute_Sum_SINR_rate_t(output_list, topology_test)
-        layout_sum_rate_1 = compute_Sum_SINR_rate_t_1(output_list, topology_test)
         layout_sum_rate_d = compute_Sum_SINR_rate_d(output_list, global_graph_test)
         print(f'Test Layout‘s sum loss：{layout_sum_loss}')
         print(f'Test Layout‘s sum rate based topology：{layout_sum_rate}')
-        print(f'Test Layout‘s sum rate check_t：{layout_sum_rate_1}')
-        print(f'Test Layout‘s sum rate based pyg_data：{-layout_sum_rate_d}')
+        print(f'Test Layout‘s sum rate based pyg_data：{-layout_sum_rate_d}')  # 为什么不一样？
 
     print('Testing finished.')
