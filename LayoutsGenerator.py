@@ -169,34 +169,46 @@ def global_convert_to_pyg(result):
     bs_nodes = [n for n, attr in G.nodes(data=True) if attr['type'] == 'BS']
     ue_nodes = [n for n, attr in G.nodes(data=True) if attr['type'] == 'UE']
 
+
     bs_mapping = {node: idx for idx, node in enumerate(bs_nodes)}
     ue_mapping = {node: idx for idx, node in enumerate(ue_nodes)}
 
     # 添加节点特征 (初始设为全1向量)
-    data['BS'].x = torch.ones(len(bs_nodes), Nt, dtype=torch.float)  # 形状 [num_BS, Nt]
-    data['UE'].x = torch.ones(len(ue_nodes), Nt, dtype=torch.float)  # 形状 [num_UE, Nt]
+    data['BS'].x = torch.ones(len(bs_nodes), 2*Nt, dtype=torch.float)  # 形状 [num_BS, 2*Nt]
+    data['UE'].x = torch.ones(len(ue_nodes), 2*Nt, dtype=torch.float)  # 形状 [num_UE, 2*Nt]
 
     # 处理边信息
     service_edges, service_attrs = [], []
     interf_edges, interf_attrs = [], []
+    # 增加反向边以满足HeteroConv，双边消息传递，即变为无向图
+    rev_service_edges, rev_service_attrs = [], [None] * len(ue_nodes)
+    rev_interf_edges, rev_interf_attrs = [], []
 
-    for u, v, attr in G.edges(data=True):
+    for u, v, attr in G.edges(data=True):  # u:BS v:UE
         if attr['edge_type'] == 'service':
             # 转换节点名为索引
             src_idx = bs_mapping[u]
             dst_idx = ue_mapping[v]
             service_edges.append((src_idx, dst_idx))
+            rev_service_edges.append((dst_idx, src_idx))  # 双向消息传递
             service_attrs.append(attr['channel'])
+
+            ue_idx = ue_mapping[v]  # 获取该UE在排序后的索引
+            rev_service_attrs[ue_idx] = attr['channel']  # 按UE顺序存储信道
+
         elif attr['edge_type'] == 'interf':
             src_idx = bs_mapping[u]
             dst_idx = ue_mapping[v]
             interf_edges.append((src_idx, dst_idx))
+            rev_interf_edges.append((dst_idx, src_idx))  # 双向消息传递
             interf_attrs.append(attr['channel'])
 
+
     # 全局信道统计量计算 --------------------------------------------------------
-    all_service = np.array(service_attrs, dtype=np.float32) if service_attrs else np.empty((0, 2 * Nt))
+    all_service_bs_idx = np.array(service_attrs, dtype=np.float32) if service_attrs else np.empty((0, 2 * Nt))
+    all_service_ue_idx = np.array(rev_service_attrs, dtype=np.float32) if service_attrs else np.empty((0, 2 * Nt))
     all_interf = np.array(interf_attrs, dtype=np.float32) if interf_attrs else np.empty((0, 2 * Nt))
-    all_channels = np.concatenate([all_service, all_interf], axis=0)
+    all_channels = np.concatenate([all_service_bs_idx, all_interf], axis=0)
 
     # 计算均值和标准差
     mean = np.mean(all_channels, axis=0, keepdims=True)
@@ -205,19 +217,30 @@ def global_convert_to_pyg(result):
     # 添加边到异构图
     if len(service_edges) > 0:
         service_edge_index = torch.tensor(service_edges).t().contiguous()  # 形状 [2, Num_service_edges]
+        rev_service_edge_index = torch.tensor(rev_service_edges).t().contiguous()  # 反向
         # 标准化数据作为特征并保留原始数据
-        service_normalized = (all_service - mean) / std
+        service_normalized = (all_service_bs_idx - mean) / std
         data['BS', 'service', 'UE'].edge_index = service_edge_index
         data['BS', 'service', 'UE'].edge_attr = torch.tensor(service_normalized, dtype=torch.float)
-        data['BS', 'service', 'UE'].original_channel = torch.tensor(all_service, dtype=torch.float)
+        data['BS', 'service', 'UE'].original_channel = torch.tensor(all_service_bs_idx, dtype=torch.float)
+        # 反向
+        data['UE', 'service', 'BS'].edge_index = rev_service_edge_index
+        data['UE', 'service', 'BS'].edge_attr = torch.tensor(service_normalized, dtype=torch.float)
+        data['UE', 'service', 'BS'].original_channel = torch.tensor(all_service_ue_idx, dtype=torch.float)  # 按 ue_idx顺序排列
+
 
     if len(interf_edges) > 0:
         interf_edge_index = torch.tensor(interf_edges).t().contiguous()
+        rev_interf_edge_index = torch.tensor(rev_interf_edges).t().contiguous()
         # 标准化数据作为特征并保留原始数据
         interf_normalized = (all_interf - mean) / std
         data['BS', 'interf', 'UE'].edge_index = interf_edge_index
         data['BS', 'interf', 'UE'].edge_attr = torch.tensor(interf_normalized, dtype=torch.float)
         data['BS', 'interf', 'UE'].original_channel = torch.tensor(all_interf, dtype=torch.float)
+        # 反向
+        data['UE', 'interf', 'BS'].edge_index = rev_interf_edge_index
+        data['UE', 'interf', 'BS'].edge_attr = torch.tensor(interf_normalized, dtype=torch.float)
+        # data['UE', 'interf', 'BS'].original_channel = torch.tensor(all_interf, dtype=torch.float)  # 非必须
 
     return data
 
@@ -354,7 +377,7 @@ def generate_topology(N, K, pl_exponent=3.0, region_size=1.0, Nt=4, max_attempts
                        edge_type='service',
                        distance=distance,
                        channel=channel)
-            service_channels.append(channel)
+            service_channels.append(channel)  # service channel按ue_index顺序排列
 
         # 干扰信道生成
         interference_channels = []
@@ -380,13 +403,14 @@ def generate_topology(N, K, pl_exponent=3.0, region_size=1.0, Nt=4, max_attempts
             'positions_bs': positions_bs,
             'positions_users': positions_users,
             'graph': G,
-            'service_channels': np.array(service_channels),
+            'service_channels': np.array(service_channels),  # service channel按ue_index顺序排列
             'interference_channels': np.array(interference_channels),
             'pl_exponent': pl_exponent,
             'Nt': Nt,
             'interference_radius': interference_radius,
             'cell_size': (2 * dx, 2 * dy),
-            'region_size': region_size
+            'region_size': region_size,
+            'associations': associations
         }
     # 超过最大尝试次数仍未满足条件
     raise RuntimeError(
