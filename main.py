@@ -261,26 +261,6 @@ def MLP(channels, batch_norm=True):
     ])
 
 
-# class PowerNormalization(nn.Module):
-#     def __init__(self, P_max=1.0, eps=1e-8):
-#         super().__init__()
-#         self.P_max = P_max
-#         self.eps = eps
-#
-#     def forward(self, W_raw):
-#         # 输入形状: (K, 2*Nt)
-#         real = W_raw[..., :W_raw.shape[-1] // 2]  # 实部
-#         imag = W_raw[..., W_raw.shape[-1] // 2:]  # 虚部
-#         # 计算总功率 (batch_size, 1, 1)
-#         power = torch.sum(real ** 2 + imag ** 2, dim=(-2, -1), keepdim=True)
-#         # 计算缩放因子
-#         scaling = torch.sqrt(self.P_max / (power + self.eps))
-#         # 缩放并合并
-#         real_norm = real * scaling
-#         imag_norm = imag * scaling
-#         return torch.cat([real_norm, imag_norm], dim=-1)
-
-
 class PowerConstraintLayer(nn.Module):
     def __init__(self, Nt_num, P_max_per_antenna_norm):
         super().__init__()
@@ -320,6 +300,35 @@ class HeteroGConv(MessagePassing):  # 边聚合
         """ 消息生成 """
         msg = self.msg_mlp(x_j)
         return msg
+
+    def update(self, aggr_out, x):
+        """ 节点更新 """
+        dst = x[1]
+        tmp = torch.cat([dst, aggr_out], dim=1)
+        update = self.update_mlp(tmp)
+        return update
+
+
+class HeteroEConv(MessagePassing):  # 边聚合, CGNN
+    """ 参数共享的异构消息传递层 """
+    def __init__(self, mlp_m, mlp_u):
+        super().__init__(aggr='sum')  # sum 保留 over-the-air 的可能
+        # super().__init__(aggr='max')
+        self.msg_mlp = mlp_m
+        self.update_mlp = mlp_u
+
+    def forward(self, x_dict, edge_index, edge_attr):
+        return self.propagate(edge_index, x=x_dict, edge_attr=edge_attr)
+
+    def message(self, x_j, edge_attr):
+        tmp = torch.cat([x_j, edge_attr], dim=1)  # x_j为源节点
+        agg = self.msg_mlp(tmp)
+        return agg
+
+    # def aggregate(self, x_j, edge_index):
+    #     row, col = edge_index
+    #     aggr_out = scatter(x_j, col, dim=-2, reduce='max')
+    #     return aggr_out
 
     def update(self, aggr_out, x):
         """ 节点更新 """
@@ -393,7 +402,50 @@ class FDGNN(nn.Module):
         return Beamforming_Matrix
 
 
-def train():
+class CGNN(nn.Module):
+    """ 参数共享 """
+    def __init__(self):
+        super().__init__()
+        self.mlp_m = MLP([2 * 2 * Nt_num, 32, 32])  # 注意和FDNN不一样，因为有边特征的concat
+        self.mlp_u = MLP([32 + 2 * Nt_num, 32, 2 * Nt_num])  # 参数共享,参数待调整
+        self.hconv_edge = HeteroEConv(self.mlp_m, self.mlp_u)
+        self.hconv = HeteroConv({
+            ('UE', 'service', 'BS'): self.hconv_edge,  # 反向消息传递
+            ('BS', 'service', 'UE'): self.hconv_edge,  # 方向：BS(src)-->UE(dst)
+            ('UE', 'interf', 'BS'): self.hconv_edge,  # 双向消息传递
+            ('BS', 'interf', 'UE'): self.hconv_edge
+        })
+        # 自己设计的输出层，等于将以原点为中心的正方形的可行域化为单位圆
+        self.bf_output = Seq(Lin(2 * Nt_num, 2 * Nt_num), Tanh(),  # 角度部分，实部虚部均归一化为[-1, 1]
+                             PowerConstraintLayer(Nt_num, P_max_per_antenna_norm=1))  # 对各天线的最大发射功率约束为单位1
+
+    def forward(self, data: HeteroData):
+        # 初始特征
+        x0_dict, edge_attr_dict, edge_index_dict = data.x_dict, data.edge_attr_dict, data.edge_index_dict
+        # 消息传递
+        x1_dict = self.hconv(x0_dict, edge_index_dict, edge_attr_dict)
+        x2_dict = self.hconv(x1_dict, edge_index_dict, edge_attr_dict)  # 边上后续可加注意力
+        out_dict = self.hconv(x2_dict, edge_index_dict, edge_attr_dict)
+        out_bfv = out_dict['UE']  # 在served_UE节点上输出对应beamforming_vector
+
+        edge_index = edge_index_dict[('BS', 'service', 'UE')]
+        out_bfm_list = [[] for _ in range(BS_num_per_Layout)]
+        # 遍历 edge_index 中的每一对边
+        for i in range(edge_index.shape[1]):
+            # 获取源节点索引
+            source_node = edge_index[0, i].item()
+            # 获取目标节点索引
+            target_node = edge_index[1, i].item()
+            # 将目标节点的特征添加到对应源节点的列表中
+            out_bfm_list[source_node].append(out_bfv[target_node])
+
+        # 将每个源节点对应的目标节点特征列表转换为张量
+        out_bfm_list = [torch.stack(item) if item else torch.empty(0, out_bfv.shape[1]) for item in out_bfm_list]
+        Beamforming_Matrix_list = [self.bf_output(out_bfm_per_BS) for out_bfm_per_BS in out_bfm_list]  # 对各天线的最大发射功率进行约束
+        return Beamforming_Matrix_list
+
+
+def train_FDGNN():
     total_loss = 0.0
     num_batches = len(subgraph_list) // batch_size + (1 if len(subgraph_list) % batch_size != 0 else 0)
     output_list_train = []
@@ -402,103 +454,40 @@ def train():
         batch_end = min(batch_start + batch_size, len(subgraph_list))
         batch_data = subgraph_list[batch_start:batch_end]
         batch_loss = 0.0
-        optimizer.zero_grad()
+        optimizer_FDGNN.zero_grad()
         for data in batch_data:
             data = data.to(device)
-            output = model(data)
-            output_list_train.append(output.detach().cpu())
+            output = model_FDGNN(data)
+            # output_list_train.append(output.detach().cpu())
+            output_list_train.append(output)
             direct_h = data['served'].original_channel
             interf_h = data['interfered'].original_channel
             loss = compute_Sum_SLNR_rate(output, direct_h, interf_h)
             # loss.backward()
             batch_loss += loss
-        batch_loss.backward()  # batch's sum_loss
-        optimizer.step()
+        avg_batch_loss = batch_loss / len(batch_data)
+        # batch_loss.backward()  # batch's sum_loss
+        avg_batch_loss.backward()  # batch's sum_loss
+        # 这里可能还是有问题，因为相当于是对全局进行后向传递，而不是对各基站的local SLNR 进行backward
+        optimizer_FDGNN.step()
         # print(f'Epoch {epoch + 1}/{num_epochs}, Batch {batch_idx + 1}/{num_batches}, Loss: {batch_loss.item()}')
         total_loss += batch_loss
     batch_sum_rate = compute_Sum_SINR_rate_t(output_list_train, topology_train)
+    avg_sum_rate = batch_sum_rate / Layouts_num
 
-    print(f'Epoch {epoch + 1}/{num_epochs}, Sum Rate (SINR): {batch_sum_rate.item()}')
+    print(f'FDGNN Epoch {epoch + 1}/{num_epochs}, Batch Sum Rate (SINR): {batch_sum_rate.item()}')
+    print(f'FDGNN Epoch {epoch + 1}/{num_epochs}, Average Sum Rate (SINR): {avg_sum_rate.item()}')
     return total_loss
 
 
-# 使用示例
-if __name__ == "__main__":
-    # 初始化参数
-    BS_num_per_Layout = 16  # 取值应满足可开方
-    Layouts_num = 16  # 取值应满足可开方
-    BS_num = BS_num_per_Layout * Layouts_num  # total BS/cell num, 相当于生成一张大图
-    avg_UE_num = 6  # average UE_num per cell
-    PathLoss_exponent = 4  # 路径衰落系数（常取3~5）
-    Region_size = 120 * (Layouts_num ** 0.5)  # Layout生成区域边长,注意与小区数匹配
-    Nt_num = 4  # MISO信道发射天线数
-
-    Batchsize_per_BS = 4  # 取值应可被Layouts_num整除
-    graph_embedding_size = 8
-    N0 = 1e-10
-    # P_max = 6
-
-    # 生成拓扑结构
-    topology_train = LG.generate_topology(
-        N=BS_num,
-        K=avg_UE_num,
-        pl_exponent=PathLoss_exponent,
-        region_size=Region_size,
-        Nt=Nt_num
-    )
-
-    # 提取子图并转化为pyg异构图结构 (已包含数据标准化)
-    '''数据标准化可能需要改进，具体见OneNote'''
-    subgraph_list = LG.cell_convert_to_pyg(topology_train)
-
-    # 加载图数据为批次
-    '''数据集导入见OneNote'''
-    # train_loader = DataLoader(subgraph_list, batch_size=BS_num_per_Layout * Batchsize_per_BS, shuffle=False,
-    #                           num_workers=0)
-    # 禁止重排序是为了更好模拟各layout数量（按layout进行规范化的）
-    # 合成一张大图，但各子图互不相连
-    # 不能用DataLoader，子图形状不定，后面计算本地损失函数时没法拆分，而且索引可能有误
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = FDGNN().to(device)
-    # model = torch.compile(model)  # torch 2.0.1可以进行编译优化, but Windows not yet supported for torch.compile
-    # optimizer = torch.optim.Adam(model.parameters(), lr=0.002)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.9)
-
-    # 前向传播
-    batch_size = BS_num_per_Layout * Batchsize_per_BS
-    num_epochs = 10
-
-    # 以subgraph的list为样本进行训练
-    for epoch in range(num_epochs):
-        model.train()
-        epoch_loss = train()
-        scheduler.step()  # 更新学习率,可暂时不选
-        print(f'Epoch {epoch + 1}/{num_epochs}, Average Loss (SLNR): {epoch_loss / len(subgraph_list)}')
-
-    print('Training finished.')
-
-
-    # test data generator
-    topology_test = LG.generate_topology(
-        N=BS_num_per_Layout, K=avg_UE_num,
-        pl_exponent=PathLoss_exponent,
-        region_size=Region_size,
-        Nt=Nt_num
-    )
-    subgraph_list_test = LG.cell_convert_to_pyg(topology_test)
-    global_graph_test = LG.global_convert_to_pyg(topology_test).to(device)
-
-    # test
-    model.eval()
+def test_FDGNN():
+    model_FDGNN.eval()
     output_list = []
     with torch.no_grad():
+        layout_sum_loss = 0
         for data in subgraph_list_test:
-            layout_sum_loss = 0
-            layout_sum_rate = 0
             data = data.to(device)
-            output = model(data)
+            output = model_FDGNN(data)
             output_list.append(output)
             direct_h = data['served'].original_channel
             interf_h = data['interfered'].original_channel
@@ -506,8 +495,142 @@ if __name__ == "__main__":
             layout_sum_loss += loss
         layout_sum_rate = compute_Sum_SINR_rate_t(output_list, topology_test)
         layout_sum_rate_d = compute_Sum_SINR_rate_d(output_list, global_graph_test)
-        print(f'Test Layout‘s sum loss：{layout_sum_loss}')
-        print(f'Test Layout‘s sum rate based topology：{layout_sum_rate}')
-        print(f'Test Layout‘s sum rate based pyg_data：{-layout_sum_rate_d}')  # 为什么不一样？
+        print(f'Test FDGNN Layout‘s sum loss (SLNR)：{layout_sum_loss}')
+        print(f'Test FDGNN Layout‘s sum rate based topology：{layout_sum_rate}')
+        print(f'Test FDGNN Layout‘s sum rate based pyg_data：{-layout_sum_rate_d}')
+    return output_list
 
-    print('Testing finished.')
+
+def train_CGNN():
+    model_CGNN.train()
+    total_loss = 0
+    # for data, topology in zip(train_loader_CGNN, global_topology_list):
+    for data in train_loader_CGNN:
+        data = data.to(device)
+        optimizer_CGNN.zero_grad()
+        out_list = model_CGNN(data)
+        # loss = compute_Sum_SINR_rate(out_list, topology)
+        loss = compute_Sum_SINR_rate_d(out_list, data)
+        loss.backward()
+        total_loss += loss.item() * data.num_graphs  # 为什么要乘？因为在sr_rate中有mean，所以可以直接乘
+        optimizer_CGNN.step()
+    return total_loss / Layouts_num
+
+
+def test_CGNN():
+    model_CGNN.eval()
+    with torch.no_grad():
+        out_list = model_CGNN(global_graph_test)
+        # loss = compute_Sum_SINR_rate(out_list, topology)
+        loss = compute_Sum_SINR_rate_d(out_list, global_graph_test)
+        print(f'Test CGNN Layout‘s sum rate：{-loss}')
+    return out_list
+
+
+# 初始化参数
+BS_num_per_Layout = 16  # 取值应满足可开方
+Layouts_num = 16  # 取值应满足可开方
+BS_num = BS_num_per_Layout * Layouts_num  # total BS/cell num, 相当于生成一张大图
+avg_UE_num = 6  # average UE_num per cell
+PathLoss_exponent = 4  # 路径衰落系数（常取3~5）
+Region_size = 120 * (Layouts_num ** 0.5)  # Layout生成区域边长,注意与小区数匹配
+Nt_num = 4  # MISO信道发射天线数
+
+Batchsize_per_BS = 4  # 取值应可被Layouts_num整除
+graph_embedding_size = 8
+N0 = 1e-10
+# P_max = 6
+
+# 生成拓扑结构
+topology_train = LG.generate_topology(
+    N=BS_num,
+    K=avg_UE_num,
+    pl_exponent=PathLoss_exponent,
+    region_size=Region_size,
+    Nt=Nt_num
+)
+
+# 提取子图并转化为pyg异构图结构 (已包含数据标准化)
+'''数据标准化可能需要改进，具体见OneNote'''
+subgraph_list = LG.cell_convert_to_pyg(topology_train)
+
+# 加载图数据为批次
+'''数据集导入见OneNote'''
+# train_loader = DataLoader(subgraph_list, batch_size=BS_num_per_Layout * Batchsize_per_BS, shuffle=False,
+#                           num_workers=0)
+# 禁止重排序是为了更好模拟各layout数量（按layout进行规范化的）
+# 合成一张大图，但各子图互不相连
+# 不能用DataLoader，子图形状不定，后面计算本地损失函数时没法拆分，而且索引可能有误
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model_FDGNN = FDGNN().to(device)
+# model = torch.compile(model)  # torch 2.0.1可以进行编译优化, but Windows not yet supported for torch.compile
+# optimizer = torch.optim.Adam(model.parameters(), lr=0.002)
+optimizer_FDGNN = torch.optim.Adam(model_FDGNN.parameters(), lr=0.01)
+scheduler_FDGNN = torch.optim.lr_scheduler.StepLR(optimizer_FDGNN, step_size=20, gamma=0.9)
+
+# 前向传播
+batch_size = BS_num_per_Layout * Batchsize_per_BS
+num_epochs = 10
+
+# 以subgraph的list为样本进行训练
+for epoch in range(num_epochs):
+    model_FDGNN.train()
+    epoch_loss = train_FDGNN()
+    scheduler_FDGNN.step()  # 更新学习率,可暂时不选
+    print(f'FDGNN Epoch {epoch + 1}/{num_epochs}, Average Loss (SLNR): {epoch_loss / len(subgraph_list)}')
+
+print('FDGNN Training finished.')
+
+# 生成拓扑结构
+# 后续对比时，subgraph_list也可以这样生成，从每一个中图中拿
+# 也可以不改动，增加美观结果的概率
+global_graph_list = []
+global_topology_list = []
+for layout_idx in range(Layouts_num):
+    topology_train = LG.generate_topology(
+        N=BS_num_per_Layout,
+        K=avg_UE_num,
+        pl_exponent=PathLoss_exponent,
+        region_size=Region_size,
+        Nt=Nt_num
+    )
+    global_graph = LG.global_convert_to_pyg(topology_train)
+    global_graph_list.append(global_graph)
+    global_topology_list.append(topology_train)
+
+train_loader_CGNN = DataLoader(global_graph_list, batch_size=1, shuffle=False,  # 暂设为1和False
+                          num_workers=0)
+
+
+model_CGNN = CGNN().to(device)
+optimizer_CGNN = torch.optim.Adam(model_CGNN.parameters(), lr=0.002)
+scheduler_CGNN = torch.optim.lr_scheduler.StepLR(optimizer_CGNN, step_size=20, gamma=0.9)  # 学习率调整
+
+for epoch in range(num_epochs):
+    loss = train_CGNN()
+    print(f'CGNN epoch: {epoch}  train_loss: {loss}')
+    scheduler_CGNN.step()  # 动态调整优化器学习率
+
+print('CGNN Training finished.')
+
+
+# test data generator
+topology_test = LG.generate_topology(
+    N=BS_num_per_Layout, K=avg_UE_num,
+    pl_exponent=PathLoss_exponent,
+    region_size=Region_size,
+    Nt=Nt_num
+)
+subgraph_list_test = LG.cell_convert_to_pyg(topology_test)
+# subgraph_list_test = subgraph_list[:BS_num_per_Layout*avg_UE_num]  # 尝试使用训练集数据
+global_graph_test = LG.global_convert_to_pyg(topology_test).to(device)
+
+# test
+out_FDGNN = test_FDGNN()
+out_CGNN = test_CGNN()
+
+rate_FDGNN = compute_Sum_SINR_rate_d(out_FDGNN, global_graph_test)
+rate_CGNN = compute_Sum_SINR_rate_d(out_CGNN, global_graph_test)
+
+print('Testing finished.')
