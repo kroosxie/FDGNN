@@ -472,7 +472,7 @@ def train_FDGNN():
         optimizer_FDGNN.step()
         # print(f'Epoch {epoch + 1}/{num_epochs}, Batch {batch_idx + 1}/{num_batches}, Loss: {batch_loss.item()}')
         total_loss += batch_loss
-    batch_sum_rate = compute_Sum_SINR_rate_t(output_list_train, topology_train)
+    batch_sum_rate = compute_Sum_SINR_rate_t(output_list_train, topology_train_FDGNN)
     avg_sum_rate = batch_sum_rate / Layouts_num
 
     print(f'FDGNN Epoch {epoch + 1}/{num_epochs}, Batch Sum Rate (SINR): {batch_sum_rate.item()}')
@@ -532,7 +532,7 @@ BS_num_per_Layout = 16  # 取值应满足可开方
 Layouts_num = 16  # 取值应满足可开方
 BS_num = BS_num_per_Layout * Layouts_num  # total BS/cell num, 相当于生成一张大图
 avg_UE_num = 6  # average UE_num per cell
-PathLoss_exponent = 4  # 路径衰落系数（常取3~5）
+PathLoss_exponent = 4  # 路径衰落系数（常取3~5），与形成干扰的半径有关
 Region_size = 120 * (Layouts_num ** 0.5)  # Layout生成区域边长,注意与小区数匹配
 Nt_num = 4  # MISO信道发射天线数
 
@@ -542,17 +542,17 @@ N0 = 1e-10
 # P_max = 6
 
 # 生成拓扑结构
-topology_train = LG.generate_topology(
+topology_train_FDGNN = LG.generate_topology(
     N=BS_num,
     K=avg_UE_num,
     pl_exponent=PathLoss_exponent,
-    region_size=Region_size,
+    region_size=Region_size * np.sqrt(Layouts_num),
     Nt=Nt_num
 )
 
 # 提取子图并转化为pyg异构图结构 (已包含数据标准化)
 '''数据标准化可能需要改进，具体见OneNote'''
-subgraph_list = LG.cell_convert_to_pyg(topology_train)
+subgraph_list = LG.cell_convert_to_pyg(topology_train_FDGNN)
 
 # 加载图数据为批次
 '''数据集导入见OneNote'''
@@ -588,16 +588,16 @@ print('FDGNN Training finished.')
 global_graph_list = []
 global_topology_list = []
 for layout_idx in range(Layouts_num):
-    topology_train = LG.generate_topology(
+    topology_train_CGNN = LG.generate_topology(
         N=BS_num_per_Layout,
         K=avg_UE_num,
         pl_exponent=PathLoss_exponent,
         region_size=Region_size,
         Nt=Nt_num
     )
-    global_graph = LG.global_convert_to_pyg(topology_train)
+    global_graph = LG.global_convert_to_pyg(topology_train_CGNN)
     global_graph_list.append(global_graph)
-    global_topology_list.append(topology_train)
+    global_topology_list.append(topology_train_CGNN)
 
 train_loader_CGNN = DataLoader(global_graph_list, batch_size=1, shuffle=False,  # 暂设为1和False
                           num_workers=0)
