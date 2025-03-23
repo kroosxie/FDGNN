@@ -344,8 +344,8 @@ class FDGNN(nn.Module):
     """ 参数共享的联邦GNN """
     def __init__(self):
         super().__init__()
-        self.mlp_m = MLP([2 * Nt_num, 32, 32])
-        self.mlp_u = MLP([32 + 2 * Nt_num, 32, 2 * Nt_num])  # 参数共享,参数待调整
+        self.mlp_m = MLP([2 * Nt_num, 32, 64])
+        self.mlp_u = MLP([64 + 2 * Nt_num, 32, 2 * Nt_num])  # 参数共享,参数待调整,需要增大，增加学习能力
         self.hconv_edge = HeteroGConv(self.mlp_m, self.mlp_u)
         self.hconv = HeteroConv({
             ('served', 'conn', 'interfered'): self.hconv_edge,
@@ -548,13 +548,13 @@ def test_CGNN():
 
 
 # 初始化参数
-# Scale_exponent = 4
-BS_num_per_Layout = 16  # 取值应满足可开方
-Layouts_num = 16  # 取值应满足可开方
+Scale_exponent = 4  # 区域扩大乘数
+BS_num_per_Layout = 16 * Scale_exponent  # 取值应满足可开方
+Layouts_num = 16  # 可调整
 BS_num = BS_num_per_Layout * Layouts_num  # total BS/cell num, 相当于生成一张大图
 avg_UE_num = 6  # average UE_num per cell
-PathLoss_exponent = 4  # 路径衰落系数（常取3~5），与形成干扰的半径有关
-Region_size = 120  # Layout生成区域边长,注意与小区数匹配，4*4小区对应120
+PathLoss_exponent = 4  # 路径衰落系数（常取3~5），与形成干扰的半径有关, 4的半径有点大，可设为5
+Region_size = 120 * int(np.sqrt(Scale_exponent))  # Layout生成区域边长,注意与小区数匹配，4*4小区对应120
 Nt_num = 4  # MISO信道发射天线数
 
 Batchsize_per_BS = 1  # 取值应可被Layouts_num整除
@@ -600,8 +600,11 @@ for layout_idx in range(Layouts_num):
 train_subgraph_list_FDGNN = all_subgraph_list
 if(shuffle_FDGNN == True):
     random.shuffle(train_subgraph_list_FDGNN)  # 可选择打乱FDGNN的训练子图顺序
-train_loader_CGNN = DataLoader(global_graph_list, batch_size=1, shuffle=False, num_workers=0)  # 暂设为1和False
+
 batch_size_FDGNN = BS_num_per_Layout * Batchsize_per_BS  # FDGNN
+
+train_loader_CGNN = DataLoader(global_graph_list, batch_size=1, shuffle=False, num_workers=0)  # 暂设为1和False
+
 
 
 # 加载图数据为批次
@@ -610,7 +613,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model_FDGNN = FDGNN().to(device)
 optimizer_FDGNN = torch.optim.Adam(model_FDGNN.parameters(), lr=0.002)
 # optimizer_FDGNN = torch.optim.Adam(model_FDGNN.parameters(), lr=0.01)
-scheduler_FDGNN = torch.optim.lr_scheduler.StepLR(optimizer_FDGNN, step_size=20, gamma=0.9)
+scheduler_FDGNN = torch.optim.lr_scheduler.StepLR(optimizer_FDGNN, step_size=40, gamma=0.9)  # 每step_size个epoch调整一次
 
 model_CGNN = CGNN().to(device)
 optimizer_CGNN = torch.optim.Adam(model_CGNN.parameters(), lr=0.002)
@@ -618,8 +621,8 @@ optimizer_CGNN = torch.optim.Adam(model_CGNN.parameters(), lr=0.002)
 scheduler_CGNN = torch.optim.lr_scheduler.StepLR(optimizer_CGNN, step_size=20, gamma=0.9)  # 学习率调整
 
 # 前向传播
-num_epochs_FDGNN = 50
-num_epochs_CGNN = 10
+num_epochs_FDGNN = 200
+num_epochs_CGNN = 50
 
 # Train FDGNN
 orig_loss_FDGNN = Notrain_FDGNN()
