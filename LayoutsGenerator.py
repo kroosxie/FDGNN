@@ -332,23 +332,23 @@ def generate_topology(N, K, pl_exponent=3.0, region_size=1.0, Nt=4, max_attempts
     for attempt in range(max_attempts):
         # 生成基站和用户坐标
         positions_bs = np.array([(dx * (2 * i + 1), dy * (2 * j + 1)) for i in range(cols) for j in range(rows)][:N])
-        positions_users = np.random.uniform(0, region_size, (N * K, 2))  # 生成全域随机用户
+        # positions_users = np.random.uniform(0, region_size, (N * K, 2))  # 生成全域随机用户
 
         # 生成用户坐标（高斯分布）
-        # positions_users = np.zeros((N * K, 2))
-        # sigma = 0.1 * region_size  # 高斯分布标准差
-        # for bs_idx in range(N):
-        #     # 每个基站生成K个用户
-        #     start_idx = bs_idx * K
-        #     end_idx = start_idx + K
-        #     # 以基站位置为中心生成高斯分布坐标
-        #     positions_users[start_idx:end_idx] = np.random.normal(
-        #         loc=positions_bs[bs_idx],
-        #         scale=sigma,
-        #         size=(K, 2)
-        #     )
-        # # 限制用户坐标在区域范围内
-        # positions_users = np.clip(positions_users, 0, region_size)
+        positions_users = np.zeros((N * K, 2))
+        sigma = 0.1 * region_size  # 高斯分布标准差
+        for bs_idx in range(N):
+            # 每个基站生成K个用户
+            start_idx = bs_idx * K
+            end_idx = start_idx + K
+            # 以基站位置为中心生成高斯分布坐标
+            positions_users[start_idx:end_idx] = np.random.normal(
+                loc=positions_bs[bs_idx],
+                scale=sigma,
+                size=(K, 2)
+            )
+        # 限制用户坐标在区域范围内
+        positions_users = np.clip(positions_users, 0, region_size)
 
         # 用户归属计算保持不变
         grid_x = (positions_users[:, 0] // (2 * dx)).astype(int).clip(0, cols - 1)
@@ -426,7 +426,7 @@ if __name__ == "__main__":
     topology = generate_topology(
         N=16,
         K=6,
-        pl_exponent=4,
+        pl_exponent=5,  # 之前是4，半径可能有点大
         region_size=120,
         Nt=4
     )
