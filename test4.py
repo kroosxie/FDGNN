@@ -7,6 +7,9 @@ from torch_geometric.loader import DataLoader
 import LayoutsGenerator as LG
 import numpy as np
 import random
+import matplotlib.pyplot as plt
+from scipy.io import savemat
+import utils
 
 def compute_Sum_SINR_rate_d(output_list, data):
     # 获取设备
@@ -449,9 +452,10 @@ class CGNN(nn.Module):
 
 def Notrain_FDGNN():
     total_loss = 0.0
+    total_SINR_rate = 0.0
     num_batches = len(train_subgraph_list_FDGNN) // batch_size_FDGNN + (1 if len(train_subgraph_list_FDGNN) % batch_size_FDGNN != 0 else 0)
-    output_list_train = []
     for batch_idx in range(num_batches):
+        output_list_layout = []
         batch_start = batch_idx * batch_size_FDGNN
         batch_end = min(batch_start + batch_size_FDGNN, len(train_subgraph_list_FDGNN))
         batch_data = train_subgraph_list_FDGNN[batch_start:batch_end]
@@ -460,18 +464,23 @@ def Notrain_FDGNN():
         for data in batch_data:
             data = data.to(device)
             output = model_FDGNN(data)
-            output_list_train.append(output)
+            output_list_layout.append(output)
             loss = compute_Sum_SLNR_rate(output, data)
             batch_loss += loss
         total_loss += batch_loss
-    return total_loss / len(train_subgraph_list_FDGNN) * BS_num_per_Layout
+        # compute SINR rate
+        layout_data = global_graph_list[batch_idx].to(device)
+        layout_sum_rate = compute_Sum_SINR_rate_d(output_list_layout, layout_data)
+        total_SINR_rate += layout_sum_rate
+    return total_loss / len(train_subgraph_list_FDGNN) * BS_num_per_Layout, total_SINR_rate / num_batches
 
 
 def train_FDGNN():
     total_loss = 0.0
+    total_SINR_rate = 0.0
     num_batches = len(train_subgraph_list_FDGNN) // batch_size_FDGNN + (1 if len(train_subgraph_list_FDGNN) % batch_size_FDGNN != 0 else 0)
-    output_list_train = []
     for batch_idx in range(num_batches):
+        output_list_layout = []
         batch_start = batch_idx * batch_size_FDGNN
         batch_end = min(batch_start + batch_size_FDGNN, len(train_subgraph_list_FDGNN))
         batch_data = train_subgraph_list_FDGNN[batch_start:batch_end]
@@ -480,22 +489,25 @@ def train_FDGNN():
         for data in batch_data:
             data = data.to(device)
             output = model_FDGNN(data)
-            output_list_train.append(output)
+            output_list_layout.append(output)
             loss = compute_Sum_SLNR_rate(output, data)
             # loss.backward()
             batch_loss += loss
-        # avg_batch_loss = batch_loss / len(batch_data)
         batch_loss.backward()  # batch's sum_loss
+        # avg_batch_loss = batch_loss / len(batch_data)
         # avg_batch_loss.backward()  # batch's sum_loss
         # 这里可能还是有问题，因为相当于是对全局进行后向传递，而不是对各基站的local SLNR 进行backward
         optimizer_FDGNN.step()
-        # print(f'Epoch {epoch + 1}/{num_epochs}, Batch {batch_idx + 1}/{num_batches}, Loss: {batch_loss.item()}')
         total_loss += batch_loss
+        # compute SINR rate
+        layout_data = global_graph_list[batch_idx].to(device)
+        layout_sum_rate = compute_Sum_SINR_rate_d(output_list_layout, layout_data)
+        total_SINR_rate += layout_sum_rate
+        # print(f'Batch {batch_idx + 1}/{num_batches}, Layout\'s SLNR rate: {batch_loss.item()}')
+        # print(f'Batch {batch_idx + 1}/{num_batches}, Layout\'s SINR rate: {layout_sum_rate.item()}')
     # batch_sum_rate = compute_Sum_SINR_rate_t(output_list_train, topology_train_FDGNN)
     # avg_sum_rate = batch_sum_rate / Layouts_num
-    # print(f'FDGNN Epoch {epoch + 1}/{num_epochs_FDGNN}, Batch Sum Rate (SINR): {batch_sum_rate.item()}')
-    # print(f'FDGNN Epoch {epoch + 1}/{num_epochs_FDGNN}, Average Sum Rate (SINR): {avg_sum_rate.item()}')
-    return total_loss / len(train_subgraph_list_FDGNN) * BS_num_per_Layout
+    return total_loss / len(train_subgraph_list_FDGNN) * BS_num_per_Layout, total_SINR_rate / num_batches
 
 
 def test_FDGNN():
@@ -541,28 +553,28 @@ def test_CGNN():
     model_CGNN.eval()
     with torch.no_grad():
         out_list = model_CGNN(global_graph_test)
-        # loss = compute_Sum_SINR_rate(out_list, topology)
-        loss = compute_Sum_SINR_rate_d(out_list, global_graph_test)
-        print(f'Test CGNN Layout‘s sum rate：{-loss}')
+        # loss = compute_Sum_SINR_rate_d(out_list, global_graph_test)
+        # print(f'Test CGNN Layout‘s sum rate：{-loss}')
     return out_list
 
 
 # 初始化参数
-Scale_exponent = 4  # 区域扩大乘数
+Scale_exponent = 1  # 区域扩大乘数
 BS_num_per_Layout = 16 * Scale_exponent  # 取值应满足可开方
-Layouts_num = 16  # 可调整
+Layouts_num = 32  # 可调整
 BS_num = BS_num_per_Layout * Layouts_num  # total BS/cell num, 相当于生成一张大图
-avg_UE_num = 6  # average UE_num per cell
-PathLoss_exponent = 4  # 路径衰落系数（常取3~5），与形成干扰的半径有关, 4的半径有点大，可设为5
+avg_UE_num = 2  # average UE_num per cell
+PathLoss_exponent = 4.5  # 路径衰落系数（常取3~5），与形成干扰的半径有关, 4的半径有点大，可设为5
 Region_size = 120 * int(np.sqrt(Scale_exponent))  # Layout生成区域边长,注意与小区数匹配，4*4小区对应120
-Nt_num = 4  # MISO信道发射天线数
+Nt_num = 8  # MISO信道发射天线数
 
 Batchsize_per_BS = 1  # 取值应可被Layouts_num整除
 graph_embedding_size = 8
-N0 = 1e-10
-# N0 = 1e-8
-P_max = 6
+# N0 = 1e-12
+N0 = 1e-8
 shuffle_FDGNN = False  # FDGNN训练子图list是否打乱顺序
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # FDGNN Data Generation
 # 法一，从超大图提取子图，这样训练有利于扩展性
@@ -606,47 +618,62 @@ batch_size_FDGNN = BS_num_per_Layout * Batchsize_per_BS  # FDGNN
 train_loader_CGNN = DataLoader(global_graph_list, batch_size=1, shuffle=False, num_workers=0)  # 暂设为1和False
 
 
-
 # 加载图数据为批次
 '''数据集导入见OneNote'''
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
 model_FDGNN = FDGNN().to(device)
-optimizer_FDGNN = torch.optim.Adam(model_FDGNN.parameters(), lr=0.002)
-# optimizer_FDGNN = torch.optim.Adam(model_FDGNN.parameters(), lr=0.01)
+optimizer_FDGNN = torch.optim.Adam(model_FDGNN.parameters(), lr=0.001)
 scheduler_FDGNN = torch.optim.lr_scheduler.StepLR(optimizer_FDGNN, step_size=40, gamma=0.9)  # 每step_size个epoch调整一次
 
 model_CGNN = CGNN().to(device)
-optimizer_CGNN = torch.optim.Adam(model_CGNN.parameters(), lr=0.002)
-# optimizer_CGNN = torch.optim.Adam(model_CGNN.parameters(), lr=0.01)
-scheduler_CGNN = torch.optim.lr_scheduler.StepLR(optimizer_CGNN, step_size=20, gamma=0.9)  # 学习率调整
+optimizer_CGNN = torch.optim.Adam(model_CGNN.parameters(), lr=0.001)
+scheduler_CGNN = torch.optim.lr_scheduler.StepLR(optimizer_CGNN, step_size=40, gamma=0.9)  # 学习率调整
 
 # 前向传播
-num_epochs_FDGNN = 200
-num_epochs_CGNN = 50
+num_epochs_FDGNN = 20
+num_epochs_CGNN = 20
+train_log_FDGNN = []
+train_log_CGNN = []
 
 # Train FDGNN
-orig_loss_FDGNN = Notrain_FDGNN()
-print(f'FDGNN Oringinal Average Layout\'s Loss (SLNR): {orig_loss_FDGNN}')
+orig_loss_FDGNN, orig_SINR_rate_FDGNN = Notrain_FDGNN()
+print(f'FDGNN Oringinal Average Layout\'s Loss (SLNR): {orig_loss_FDGNN}, Average Layout\'s Loss (SINR): {orig_SINR_rate_FDGNN}')
 # 以subgraph的list为样本进行训练
 for epoch in range(num_epochs_FDGNN):
     model_FDGNN.train()
-    epoch_loss_FDGNN = train_FDGNN()
+    epoch_loss_FDGNN, epoch_SINR_rate_FDGNN = train_FDGNN()
     scheduler_FDGNN.step()  # 更新学习率,可暂时不
-    print(f'FDGNN Epoch {epoch + 1}/{num_epochs_FDGNN}, Average Layout\'s Loss (SLNR): {epoch_loss_FDGNN}')
+    print(f'FDGNN Epoch {epoch + 1}/{num_epochs_FDGNN}, Average Layout\'s Loss (SLNR): {epoch_loss_FDGNN}, '
+          f'Average Layout\'s Loss (SINR): {epoch_SINR_rate_FDGNN}')
+    train_log_FDGNN.append(-epoch_loss_FDGNN.item())
 print('FDGNN Training finished.')
 
+train_log_array_FDGNN = np.array(train_log_FDGNN)  # 将列表转换为NumPy数组
+data_to_save_FDGNN = {'train_loss': train_log_array_FDGNN}  # 创建字典
+savemat('train_loss_FDGNN.mat', data_to_save_FDGNN)  # 保存为.mat文件
+
+torch.save(model_FDGNN, 'model_FDGNN.pth')
+print('model_FDGNN saved.')
 
 for epoch in range(num_epochs_CGNN):
     model_CGNN.train()
     epoch_loss_CGNN = train_CGNN()
     print(f'CGNN epoch: {epoch+1}/{num_epochs_CGNN}, Average Layout\'s Loss (SINR): {epoch_loss_CGNN}')
+    train_log_CGNN.append(epoch_loss_CGNN)
     scheduler_CGNN.step()  # 动态调整优化器学习率
 print('CGNN Training finished.')
 
+train_log_array_CGNN = np.array(train_log_CGNN)  # 将列表转换为NumPy数组
+data_to_save_CGNN = {'train_loss': train_log_array_CGNN}  # 创建字典
+savemat('train_loss_CGNN.mat', data_to_save_CGNN)  # 保存为.mat文件
+
+torch.save(model_CGNN, 'model_CGNN.pth')
+print('model_CGNN saved.')
 
 # test data generator
+BS_num_per_Layout_test = 16
 topology_test = LG.generate_topology(
-    N=BS_num_per_Layout, K=avg_UE_num,
+    N=BS_num_per_Layout_test, K=avg_UE_num,
     pl_exponent=PathLoss_exponent,
     region_size=Region_size,
     Nt=Nt_num
@@ -657,12 +684,24 @@ global_graph_test = LG.global_convert_to_pyg(topology_test).to(device)
 # test
 out_FDGNN = test_FDGNN()
 out_CGNN = test_CGNN()
+out_ZF = utils.compute_ZF_beamforming(global_graph_test, Nt_num)
 
 rate_FDGNN = compute_Sum_SINR_rate_d(out_FDGNN, global_graph_test)
 rate_CGNN = compute_Sum_SINR_rate_d(out_CGNN, global_graph_test)
+rate_ZF = compute_Sum_SINR_rate_d(out_ZF, global_graph_test)
 
 # print(f'Test FDGNN Layout‘s sum rate based topology：{layout_sum_rate}')
 print(f'FDGNN Layout_test‘s sum rate based pyg_data：{rate_FDGNN}')
 print(f'CGNN Layout_test‘s sum rate based pyg_data：{rate_CGNN}')
+print(f'ZF Layout_test‘s sum rate based pyg_data：{rate_ZF}')
 
 print('Testing finished.')
+
+# plot train loss
+plt.plot(train_log_FDGNN, label='FDGNN')
+plt.plot(train_log_CGNN, label='CGNN')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Train Loss')
+plt.legend()
+plt.show()
