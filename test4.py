@@ -271,23 +271,33 @@ class PowerConstraintLayer(nn.Module):
         super().__init__()
         self.Nt_num = Nt_num
         self.P_max_per_antenna_norm = P_max_per_antenna_norm
+        self.P_max_per_bs_norm = P_max_per_antenna_norm  # 暂设为一样
 
     def forward(self, Beamforming_Matrix):
-        num_antennas = self.Nt_num
-        real_part = Beamforming_Matrix[:, :num_antennas]
-        imag_part = Beamforming_Matrix[:, num_antennas:]
-        complex_part = real_part + 1j * imag_part
+        # case 1：对各天线发射功率进行约束
+        # num_antennas = self.Nt_num
+        # real_part = Beamforming_Matrix[:, :num_antennas]
+        # imag_part = Beamforming_Matrix[:, num_antennas:]
+        # complex_part = real_part + 1j * imag_part
+        #
+        # norms = torch.norm(complex_part, dim=0)  # 计算每列的范数
+        # mask = norms > self.P_max_per_antenna_norm
+        # scale_factors = torch.where(mask,
+        #                             self.P_max_per_antenna_norm / norms,
+        #                             torch.ones_like(norms))
+        #
+        # scaled_real = real_part * scale_factors
+        # scaled_imag = imag_part * scale_factors
+        # BFM_normalized = torch.cat([scaled_real, scaled_imag], dim=1)
 
-        norms = torch.norm(complex_part, dim=0)  # 计算每列的范数
-        mask = norms > self.P_max_per_antenna_norm
-        scale_factors = torch.where(mask,
-                                    self.P_max_per_antenna_norm / norms,
-                                    torch.ones_like(norms))
-
-        scaled_real = real_part * scale_factors
-        scaled_imag = imag_part * scale_factors
-
-        return torch.cat([scaled_real, scaled_imag], dim=1)
+        # case 2：对整个Beamforming Matrix进行功率约束（基站发射功率约束）
+        norms = torch.norm(Beamforming_Matrix)
+        # 判断是否大于基站功率约束
+        if norms > self.P_max_per_bs_norm:
+            BFM_normalized = Beamforming_Matrix / norms
+        else:
+            BFM_normalized = Beamforming_Matrix
+        return BFM_normalized
 
 
 class HeteroGConv(MessagePassing):  # 边聚合
@@ -446,7 +456,7 @@ class CGNN(nn.Module):
 
         # 将每个源节点对应的目标节点特征列表转换为张量
         out_bfm_list = [torch.stack(item) if item else torch.empty(0, out_bfv.shape[1]) for item in out_bfm_list]
-        Beamforming_Matrix_list = [self.bf_output(out_bfm_per_BS) for out_bfm_per_BS in out_bfm_list]  # 对各天线的最大发射功率进行约束
+        Beamforming_Matrix_list = [self.bf_output(out_bfm_per_BS) for out_bfm_per_BS in out_bfm_list]  # 对各天线/基站的最大发射功率进行约束
         return Beamforming_Matrix_list
 
 
@@ -467,6 +477,10 @@ def Notrain_FDGNN():
             output_list_layout.append(output)
             loss = compute_Sum_SLNR_rate(output, data)
             batch_loss += loss
+            # zf 对比
+            # zf_out = utils.compute_ZF_beamforming_local(data, Nt_num)
+            # zf_SLNR_rate = compute_Sum_SLNR_rate(zf_out, data)
+            # print(f'comparation: {loss}, {zf_SLNR_rate}')
         total_loss += batch_loss
         # compute SINR rate
         layout_data = global_graph_list[batch_idx].to(device)
@@ -503,6 +517,7 @@ def train_FDGNN():
         layout_data = global_graph_list[batch_idx].to(device)
         layout_sum_rate = compute_Sum_SINR_rate_d(output_list_layout, layout_data)
         total_SINR_rate += layout_sum_rate
+
         # print(f'Batch {batch_idx + 1}/{num_batches}, Layout\'s SLNR rate: {batch_loss.item()}')
         # print(f'Batch {batch_idx + 1}/{num_batches}, Layout\'s SINR rate: {layout_sum_rate.item()}')
     # batch_sum_rate = compute_Sum_SINR_rate_t(output_list_train, topology_train_FDGNN)
@@ -563,15 +578,16 @@ Scale_exponent = 1  # 区域扩大乘数
 BS_num_per_Layout = 16 * Scale_exponent  # 取值应满足可开方
 Layouts_num = 32  # 可调整
 BS_num = BS_num_per_Layout * Layouts_num  # total BS/cell num, 相当于生成一张大图
-avg_UE_num = 2  # average UE_num per cell
-PathLoss_exponent = 4.5  # 路径衰落系数（常取3~5），与形成干扰的半径有关, 4的半径有点大，可设为5
+avg_UE_num = 6  # average UE_num per cell
+PathLoss_exponent = 6  # 路径衰落系数（常取3~5），与形成干扰的半径有关, 4的半径有点大，可设为5
 Region_size = 120 * int(np.sqrt(Scale_exponent))  # Layout生成区域边长,注意与小区数匹配，4*4小区对应120
-Nt_num = 8  # MISO信道发射天线数
+Nt_num = 16  # MISO信道发射天线数
 
 Batchsize_per_BS = 1  # 取值应可被Layouts_num整除
 graph_embedding_size = 8
-# N0 = 1e-12
-N0 = 1e-8
+N0 = 1e-10  # 中间值
+# N0 = 1e-8  # 使用该值FDGNN和CGNN（SLNR和SINR）接近，zero-forcing失效
+# N0 = 1e-12  # Zero-Forcing 良好工作（也不一定）
 shuffle_FDGNN = False  # FDGNN训练子图list是否打乱顺序
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -630,8 +646,8 @@ optimizer_CGNN = torch.optim.Adam(model_CGNN.parameters(), lr=0.001)
 scheduler_CGNN = torch.optim.lr_scheduler.StepLR(optimizer_CGNN, step_size=40, gamma=0.9)  # 学习率调整
 
 # 前向传播
-num_epochs_FDGNN = 20
-num_epochs_CGNN = 20
+num_epochs_FDGNN = 400
+num_epochs_CGNN = 400
 train_log_FDGNN = []
 train_log_CGNN = []
 
@@ -684,7 +700,7 @@ global_graph_test = LG.global_convert_to_pyg(topology_test).to(device)
 # test
 out_FDGNN = test_FDGNN()
 out_CGNN = test_CGNN()
-out_ZF = utils.compute_ZF_beamforming(global_graph_test, Nt_num)
+out_ZF = utils.compute_ZF_beamforming_global(global_graph_test, Nt_num)
 
 rate_FDGNN = compute_Sum_SINR_rate_d(out_FDGNN, global_graph_test)
 rate_CGNN = compute_Sum_SINR_rate_d(out_CGNN, global_graph_test)
