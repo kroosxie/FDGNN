@@ -426,7 +426,7 @@ if __name__ == "__main__":
     topology = generate_topology(
         N=16,
         K=6,
-        pl_exponent=5,  # 之前是4，半径可能有点大
+        pl_exponent=6,  # 之前是4，半径可能有点大
         region_size=120,
         Nt=4
     )
